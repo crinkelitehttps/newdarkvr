@@ -1,0 +1,28 @@
+DML1
+
+// Phase 0 feasibility spike -- see README.md and phase0-spike/SETUP.md in
+// the Thief2-newdark project. Applies to every mission ("miss_all") so it
+// works regardless of which mission a fresh New Game lands on.
+//
+// IMPORTANT: mission dbmods (this file) only apply when a mission is loaded
+// FRESH (e.g. starting a New Game, or a normal mission-to-mission
+// transition) -- NOT when continuing/loading an existing savegame, since a
+// savegame's object data overrides the mission file entirely. Start a New
+// Game to test this.
+//
+// Creates two throwaway, invisible, non-solid Marker objects:
+//   - "HeadMarker": positional/facing anchor the camera gets attached to.
+//   - "HeadTrackController": carries the test script (HeadTrackSpikeAuto.nut,
+//     loaded via this mod's own sq_scripts folder).
+// Safe to delete this file (and HeadTrackSpikeAuto.nut) at any time to fully
+// remove the test -- nothing here touches the base game or save data.
+
+Create "Marker" "HeadMarker"
+
+Create "Marker" "HeadTrackController"
+{
+	+ObjProp "Scripts"
+	{
+		"Script 0" "HeadTrackSpikeAuto"
+	}
+}

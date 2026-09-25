@@ -1,0 +1,29 @@
+# Binary copies of the game executable are never committed — copyrighted
+# game software, opaque to git diffs, and would bloat history forever.
+# Track SHA256 hashes in README.md instead, and put actual patch logic
+# (scripts, offsets, asm diffs) under patches/ where it belongs.
+bin/*.exe
+bin/*.dll
+
+# Common local scratch/output
+*.log
+__pycache__/
+*.pyc
+
+# Ghidra project (large, regenerable from bin/Thief2.orig.exe)
+ghidra-proj/
+
+# Built helper DLL (regenerate with headlook/build.sh)
+headlook/*.dll
+
+# hmd_bridge: the built helper and the fetched OpenVR runtime DLL (regenerate with tools/hmd_bridge/build.sh)
+tools/hmd_bridge/*.exe
+tools/hmd_bridge/openvr_api.dll
+
+# Built XInput->DirectInput joystick proxy (regenerate with xinput_joy/build.sh)
+xinput_joy/*.dll
+headlook/openvr32/
+d3d9proxy/*.dll
+
+# Release zips (tools/make_release.sh)
+dist/
