@@ -16,23 +16,40 @@ You need
 This zip contains no game files and no emulator: only the mod (three DLLs, settings and launchers).
 
 
-1. Install WinlatorXR
----------------------
-* Download WinlatorXR-cats-27.apk (or newer) from https://github.com/WinlatorXR/WinlatorXR/releases
-* Install it with SideQuest (https://sidequestvr.com) or Meta Quest Developer Hub. It appears under
-  "Unknown sources" in the headset's app library.
+1. Install WinlatorXR (the Windows emulator the game runs in)
+------------------------------------------------------------
+WinlatorXR isn't in Meta's store, so it's "sideloaded": installed from a PC over a USB cable.
+
+a) Turn on developer mode (once):
+   * Create a free Meta developer account/organisation at https://developers.meta.com (any name will do).
+   * In the Meta Horizon app on your phone: Devices > your headset > Headset settings > Developer mode: On.
+     Restart the headset.
+b) Get the APK: download WinlatorXR-cats-27.apk (or newer) on the PC from
+   https://github.com/WinlatorXR/WinlatorXR/releases
+c) Install it with SideQuest (Advanced Installer, free, https://sidequestvr.com):
+   * Connect the headset to the PC with a USB-C cable. In the headset, answer "Allow USB debugging?" with
+     "Always allow from this computer". SideQuest's status light turns green.
+   * Drag the APK file onto the SideQuest window (or use its "Install APK file from folder" button).
+d) In the headset, WinlatorXR is in the app library under "Unknown sources" (use the filter at the top).
+   Start it once and let it finish setting itself up.
 
 
 2. Check the plain game runs (no mod yet)
 -----------------------------------------
-* Copy your whole Thief II folder from the PC to the headset, for example into Download/thief_2
-  (in Steam: right-click Thief II > Manage > Browse local files).
+* Copy your whole Thief II folder from the PC to the headset's Download folder (about 2 GB):
+  - On the PC, find the game folder (in Steam: right-click Thief II > Manage > Browse local files). Its folder
+    is usually called "Thief 2" or "thief_2".
+  - Connect the headset with the cable. In the headset, allow access to its files when asked.
+  - In Windows File Explorer, open "Quest 3" (under This PC) > Internal shared storage > Download, and copy
+    the game folder there. Then rename the copy on the headset to thief_2, so the paths below match.
+  - WinlatorXR sees the headset's Download folder as drive D:, so the game is now at D:\thief_2.
 * In WinlatorXR, create a container. Suggested settings:
   - Graphics driver: Turnip (the default for Quest).
   - DX wrapper: DXVK.
   - Box64 preset: the default. If the game crashes, try "Stability"; if it's slow, "Performance".
-* Start Thief2.exe from the container's file browser, get to the main menu, then start a new game and
-  walk around for a minute.
+* Start the container: it opens a Windows desktop with a file manager. Go to D:\thief_2 and open
+  Thief2.exe. (You can also make a shortcut to it in WinlatorXR, to start it straight from the app.)
+  Get to the main menu, then start a new game and walk around for a minute.
 
   >> Please tell us: does it start, does a mission load, and roughly how smooth is it?
      If it doesn't work at this step, the mod can't work either, so please stop and report here.
@@ -40,7 +57,8 @@ This zip contains no game files and no emulator: only the mod (three DLLs, setti
 
 3. Install the mod
 ------------------
-Copy everything from this zip into the Thief II folder on the headset, next to Thief2.exe:
+Unzip this zip on the PC. Copy the files INSIDE its folder (not the folder itself) into the game folder on the
+headset (Quest 3 > Internal shared storage > Download > thief_2), next to Thief2.exe:
     d3d9.dll  headlook.dll  dinput.dll  headlook.ini  xinput_joy.ini
     thief2vr_quest.bnd  run_quest.bat  run_quest_1080.bat
 (Starting Thief2.exe directly still plays the normal flat game, just with the mod loaded.)
@@ -62,8 +80,8 @@ If you can't find these, test anyway and tell us what happens.
 
 5. Play
 -------
-Start run_quest.bat (1280x720, the safe choice). If that works well, try run_quest_1080.bat (sharper
-but slower).
+In the container's file manager, go to D:\thief_2 and open run_quest.bat (1280x720, the safe choice), or
+make a WinlatorXR shortcut to it. If that works well, try run_quest_1080.bat (sharper but slower).
 * Menus, books and loading screens appear on WinlatorXR's normal flat screen.
 * When a mission starts it should switch to full 3D VR. Look around: the world should stay still
   while your head moves.
@@ -90,8 +108,15 @@ Controls (rebind in Options > Controls > Customize Controls, using the controlle
 
 6. What to send back
 --------------------
-After a test, please send these files from the Thief II folder (they're plain text):
+After a test, quit the game, then get these files from the game folder (they're plain text):
     headlook.log   d3d9proxy.log   dinput.log   Thief2.log
+* Connect the headset to the PC with the cable and allow file access in the headset.
+* In Windows File Explorer: Quest 3 > Internal shared storage > Download > thief_2. Copy the four files to
+  the PC, and attach them to your message (or zip them first).
+* If the files are missing or look old, unplug the cable and plug it in again: Windows sometimes shows an
+  out-of-date list of the headset's files. Restarting the headset also helps.
+* headlook.log is started afresh every time the game starts, so copy the logs off before running the game
+  again (or rename headlook.log to keep it).
 And tell us, in your own words:
   a) Did the plain game run (step 2)? How smooth?
   b) With run_quest.bat: did the mission appear in 3D in the headset, or did something else happen
