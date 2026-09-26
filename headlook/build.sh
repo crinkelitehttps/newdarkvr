@@ -8,7 +8,7 @@ TAG=v2.15.6
 mkdir -p openvr32
 [ -f openvr32/openvr_api.dll ] || curl -sSfL -o openvr32/openvr_api.dll \
   "https://raw.githubusercontent.com/ValveSoftware/openvr/$TAG/bin/win32/openvr_api.dll"
-i686-w64-mingw32-gcc -O2 -std=gnu11 -Wall -Wextra -isystem ../tools/hmd_bridge -shared -o headlook.dll headlook.c vr_openvr.c \
+i686-w64-mingw32-gcc -O2 -std=gnu11 -Wall -Wextra -isystem ../tools/hmd_bridge -shared -o headlook.dll headlook.c vr_openvr.c vr_gpu.c vr_wxr.c \
   -lws2_32 -static-libgcc -Wl,--kill-at
 i686-w64-mingw32-strip headlook.dll 2>/dev/null || true
 ls -l headlook.dll openvr32/openvr_api.dll

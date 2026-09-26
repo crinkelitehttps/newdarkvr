@@ -58,6 +58,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include "vr_openvr.h"
+#include "vr_wxr.h"
 
 /* Link-time addresses in Thief2.exe (image base 0x400000, sha256 af56a109...); rebased at run time. */
 #define LINK_BASE      0x400000u
@@ -161,6 +162,11 @@ typedef struct {
     int    vr_hud_key, vr_hud_pad;                /* HUD panel show/hide toggle: a virtual-key code, an XInput button mask (0 = none) */
     int    vr_gem_always;                         /* with the HUD toggled off, still show the light gem */
     double vr_gem_x0, vr_gem_y0, vr_gem_x1, vr_gem_y1;   /* where the light gem is on the screen (fractions, y down) */
+    int    vr_pipeline;                           /* read the eyes (and the HUD) back a frame later, when the GPU is done */
+    int    vr_gpu_gamma;                          /* brightness curve in a GPU pass instead of the CPU loop */
+    double wxr_fov;                               /* stereo=wxr: field of view to draw, degrees (0 = the headset's own) */
+    int    wxr_roll;                              /* stereo=wxr: draw head roll (WinlatorXR places the picture with it) */
+    double wxr_ipd_scale;                         /* stereo=wxr: eye distance = the headset's IPD times this (1 = true scale) */
 } config_t;
 
 static config_t cfg;
@@ -191,6 +197,7 @@ static double ini_double(const char *ini, const char *key, double def)
 
 #define STEREO_SBS    1
 #define STEREO_OPENVR 2
+#define STEREO_WXR    3               /* WinlatorXR (standalone Quest etc.), see vr_wxr.c */
 
 /* "sbs"/"on"/"1" -> 1; "openvr"/"vr" -> 2; "off"/"0"/"" -> 0; anything else is logged and treated as off. */
 static int parse_stereo(const char *v, const char *where)
@@ -198,7 +205,8 @@ static int parse_stereo(const char *v, const char *where)
     if (!v[0] || !_stricmp(v, "off") || !strcmp(v, "0") || !_stricmp(v, "none")) return 0;
     if (!_stricmp(v, "sbs") || !_stricmp(v, "on") || !strcmp(v, "1")) return STEREO_SBS;
     if (!_stricmp(v, "openvr") || !_stricmp(v, "vr")) return STEREO_OPENVR;
-    hl_log("unknown stereo mode '%s' from %s (use off, sbs or openvr): treating as off", v, where);
+    if (!_stricmp(v, "wxr") || !_stricmp(v, "winlatorxr") || !_stricmp(v, "quest")) return STEREO_WXR;
+    hl_log("unknown stereo mode '%s' from %s (use off, sbs, openvr or wxr): treating as off", v, where);
     return 0;
 }
 
@@ -240,6 +248,11 @@ static void load_config(void)
     cfg.vr_gem_y0     = ini_double(ini, "vr_gem_y0", 0.82);
     cfg.vr_gem_x1     = ini_double(ini, "vr_gem_x1", 0.60);
     cfg.vr_gem_y1     = ini_double(ini, "vr_gem_y1", 1.00);
+    cfg.vr_pipeline   = (int)ini_double(ini, "vr_pipeline", 1) != 0;
+    cfg.vr_gpu_gamma  = (int)ini_double(ini, "vr_gpu_gamma", 1) != 0;
+    cfg.wxr_fov       = ini_double(ini, "wxr_fov", 0);
+    cfg.wxr_roll      = (int)ini_double(ini, "wxr_roll", 1) != 0;
+    cfg.wxr_ipd_scale = ini_double(ini, "wxr_ipd_scale", 1.0);
     cfg.udp_port     = (int)ini_double(ini, "udp_port", 4242);
     cfg.tcp_port     = (int)ini_double(ini, "tcp_port", 4243);
     cfg.yaw_sign     = ini_double(ini, "yaw_sign", -1) < 0 ? -1 : 1;
@@ -466,9 +479,21 @@ static HRESULT WINAPI vr_Present(IDirect3DDevice9 *d, const RECT *a, const RECT 
     if (g_in_present) return g_first_present(d, a, b, w, c);
     g_present_calls++;
     g_in_present = 1;
+    if (cfg.stereo == STEREO_WXR) {
+        wxr_present_cfg_t pc;
+        int in_game = GetTickCount() - g_last_vr_tick < 250;
+        pc.hud = cfg.vr_hud && (g_hud_visible || cfg.vr_gem_always);
+        pc.gem_only = !g_hud_visible;
+        pc.gem_x0 = (float)cfg.vr_gem_x0; pc.gem_y0 = (float)cfg.vr_gem_y0;
+        pc.gem_x1 = (float)cfg.vr_gem_x1; pc.gem_y1 = (float)cfg.vr_gem_y1;
+        pc.hud_deg = (float)cfg.vr_hud_deg; pc.hud_down = (float)cfg.vr_hud_down; pc.dist = (float)cfg.vr_hud_dist;
+        pc.gamma = (float)cfg.vr_gamma; pc.black = (float)cfg.vr_black;
+        wxr_present(d, in_game, &pc);
+    }
     if (cfg.stereo == STEREO_OPENVR && vr_ready()) {
         int in_game = GetTickCount() - g_last_vr_tick < 250;
-        if (!in_game && cfg.vr_idle_frames) vr_idle_frame();   /* no 3D frame lately: menus, loading, paused */
+        if (!in_game && cfg.vr_idle_frames) vr_idle_frame(d);  /* no 3D frame lately: menus, loading, paused */
+        else if (!in_game) vr_device_reset();         /* no idle frames: still drop the kept eye surfaces in menus */
         if (cfg.vr_hud && in_game && !g_hud_visible && !cfg.vr_gem_always) vr_hud_hide();   /* toggled off: menus still show */
         else if (cfg.vr_hud) {
             double t = vr_ms();
@@ -479,6 +504,7 @@ static HRESULT WINAPI vr_Present(IDirect3DDevice9 *d, const RECT *a, const RECT 
             hc.gem_only = in_game && !g_hud_visible;  /* toggled off: just the light gem (vr_gem_always) */
             hc.gem_x0 = (float)cfg.vr_gem_x0; hc.gem_y0 = (float)cfg.vr_gem_y0;
             hc.gem_x1 = (float)cfg.vr_gem_x1; hc.gem_y1 = (float)cfg.vr_gem_y1;
+            hc.pipeline = cfg.vr_pipeline;
             vr_hud_present(d, in_game, &hc);
             vr_prof(P_HUD, vr_ms() - t);
         }
@@ -490,6 +516,23 @@ static HRESULT WINAPI vr_Present(IDirect3DDevice9 *d, const RECT *a, const RECT 
         vr_prof(P_PRESENT, vr_ms() - t);
     }
     g_in_present = 0;
+    return hr;
+}
+
+/* Device Reset (slot 16): the engine resets its device when switching between menus and a mission. Our kept
+ * default-pool surfaces (eye captures, the HUD copy; see vr_device_reset) must be released first or it fails. */
+typedef HRESULT (WINAPI *reset_fn_t)(IDirect3DDevice9 *, D3DPRESENT_PARAMETERS *);
+static reset_fn_t o_vr_Reset, g_first_reset;
+static int g_in_reset;
+static HRESULT WINAPI vr_Reset(IDirect3DDevice9 *d, D3DPRESENT_PARAMETERS *pp)
+{
+    HRESULT hr;
+    if (g_in_reset) return g_first_reset(d, pp);  /* re-entered through someone else's hook: see vr_Present */
+    g_in_reset = 1;
+    if (cfg.stereo == STEREO_WXR) wxr_device_reset(); else vr_device_reset();
+    hr = o_vr_Reset(d, pp);
+    g_in_reset = 0;
+    if (FAILED(hr)) hl_log("openvr: device Reset failed: %#lx", (unsigned long)hr);
     return hr;
 }
 
@@ -552,7 +595,7 @@ static void hook_create_device(void)
  * before it can create its device. With the stand-in, Thief2.exe needs no patch: this DLL is loaded by it. */
 __declspec(dllexport) void __cdecl headlook_d3d_created(void *d3d)
 {
-    if (cfg.stereo == STEREO_OPENVR) hook_d3d_object((IDirect3D9 *)d3d, "the game's IDirect3D9, from the d3d9.dll stand-in");
+    if (cfg.stereo == STEREO_OPENVR || cfg.stereo == STEREO_WXR) hook_d3d_object((IDirect3D9 *)d3d, "the game's IDirect3D9, from the d3d9.dll stand-in");
 }
 
 /* Worker, every tick: (re)install vr_Present in the device's Present slot. The first build patched it once
@@ -565,6 +608,14 @@ static void ensure_present_hook(void)
     IDirect3DDevice9 *dev = g_created_dev ? g_created_dev : (g_dev_slot ? *g_dev_slot : NULL);
     if (!dev) return;
     vt = *(void ***)dev;
+    if (vt[16] != (void *)vr_Reset) {
+        static int rpatches;
+        module_of(vt[16], was, sizeof was);
+        if (patch_vt(vt, 16, (void *)vr_Reset, (void **)&o_vr_Reset)) {
+            if (!g_first_reset) g_first_reset = o_vr_Reset;
+            if (rpatches++ < 20) hl_log("openvr: Reset hook %s (slot held %s)", rpatches == 1 ? "installed" : "RE-installed", was);
+        }
+    }
     if (vt[17] == (void *)vr_Present) return;
     module_of(vt[17], was, sizeof was);
     if (!patch_vt(vt, 17, (void *)vr_Present, (void **)&o_vr_Present)) {
@@ -713,7 +764,8 @@ static void stereo_frame(IDirect3DDevice9 *dev, const unsigned char *cam)
     int pass, no_desktop_sbs = 0;
     HRESULT hr;
 
-    g_ovl_skip = g_vr_frame && cfg.vr_hud && cfg.vr_hud_overlays && g_ovl_orig;
+    /* WinlatorXR: the HUD is always drawn apart (and put into both eyes at Present), even with vr_hud 0 (then dropped). */
+    g_ovl_skip = g_vr_frame && (cfg.vr_hud || cfg.stereo == STEREO_WXR) && cfg.vr_hud_overlays && g_ovl_orig;
 
     if (g_trace) trace_flush("no Present seen before the next frame");
     if (g_dump_req || g_dump_key) {                    /* start the one-shot diagnostic on this frame */
@@ -735,6 +787,7 @@ static void stereo_frame(IDirect3DDevice9 *dev, const unsigned char *cam)
     ry = -cos(hd);
     step = (g_swap ? -1.0f : 1.0f) * g_ipd * 0.5f;
     memset(&d, 0, sizeof d);
+    if (g_vr_frame && cfg.stereo == STEREO_OPENVR) vr_set_picture((float)cfg.vr_gamma, (float)cfg.vr_black);   /* before the passes: the GPU curve uses it */
 
     for (pass = 0; pass < 2; pass++) {
         float s = pass == 0 ? -step : step;            /* left eye is the -right side */
@@ -763,7 +816,7 @@ static void stereo_frame(IDirect3DDevice9 *dev, const unsigned char *cam)
             half[0].left = 0;                   half[0].top = 0; half[0].right = (LONG)(d.Width / 2); half[0].bottom = (LONG)d.Height;
             half[1].left = (LONG)(d.Width / 2); half[1].top = 0; half[1].right = (LONG)d.Width;       half[1].bottom = (LONG)d.Height;
         }
-        if (pass == 0 && !(no_desktop_sbs = g_vr_frame && cfg.vr_hud && !g_trace)) {
+        if (pass == 0 && !(no_desktop_sbs = g_vr_frame && (cfg.vr_hud || cfg.stereo == STEREO_WXR) && !g_trace)) {
             /* Default-pool surface: made and released every frame, because one that outlives the frame would make
              * the engine's later device Reset (mode switches between menu and mission) fail. */
             hr = IDirect3DDevice9_CreateRenderTarget(dev, d.Width, d.Height, d.Format, D3DMULTISAMPLE_NONE, 0, FALSE, &comp, NULL);
@@ -778,7 +831,8 @@ static void stereo_frame(IDirect3DDevice9 *dev, const unsigned char *cam)
          * screen position both eyes: it marks a direction, not a point in space, so it should have no
          * parallax. */
         if (g_marks_on && !g_vr_frame) draw_reference_marks(dev, d.Width, d.Height);   /* not in VR: placed for the wrong FOV */
-        if (g_vr_frame) vr_capture_eye(dev, cur, pass ^ (g_swap ? 1 : 0), cfg.vr_gpu_convert);   /* pass 0 is the right eye when swapped */
+        if (g_vr_frame && cfg.stereo == STEREO_WXR) wxr_capture_eye(dev, cur, pass ^ (g_swap ? 1 : 0), (float)cfg.vr_gamma, (float)cfg.vr_black);
+        else if (g_vr_frame) vr_capture_eye(dev, cur, pass ^ (g_swap ? 1 : 0), cfg.vr_gpu_convert, cfg.vr_gpu_gamma);   /* pass 0 is the right eye when swapped */
         if (g_trace) {
             tr(pass == 0 ? "-- left pass returned --" : "-- right pass returned --");
             dump_surface(dev, cur, pass == 0 ? "stereo_1_left_pass.bmp" : "stereo_2_right_pass.bmp");
@@ -806,8 +860,8 @@ static void stereo_frame(IDirect3DDevice9 *dev, const unsigned char *cam)
         draw_overlays_once(dev);
     }
     if (g_vr_frame) {
-        vr_set_picture((float)cfg.vr_gamma, (float)cfg.vr_black);
-        vr_end_frame(dev, g_vr_scale, g_vr_horplus, cfg.vr_hdr_linear);
+        if (cfg.stereo == STEREO_WXR) wxr_end_frame(g_vr_scale, g_vr_horplus);
+        else vr_end_frame(dev, g_vr_scale, g_vr_horplus, cfg.vr_hdr_linear, cfg.vr_pipeline);
         g_last_vr_tick = GetTickCount();
     }
     g_stereo_frames++;
@@ -889,7 +943,7 @@ static void __cdecl hl_scene(void)
     if (in_player_view && g_stereo_on) {
         double yaw_r, pitch_u;
         g_vr_frame = 0;
-        if (cfg.stereo == STEREO_OPENVR && vr_begin_frame(&yaw_r, &pitch_u)) {
+        if (cfg.stereo == STEREO_OPENVR && vr_begin_frame(dev, &yaw_r, &pitch_u)) {
             /* Same sign convention as the OpenTrack packets hmd_bridge sent (yaw + = right, pitch + = up), so the
              * ini's yaw_sign/pitch_sign apply unchanged; gains, clamps, smoothing and roll do not (the headset
              * picture must match the head 1:1; the compositor reprojects the roll we do not draw). */
@@ -898,6 +952,18 @@ static void __cdecl hl_scene(void)
             g_roll = 0;
             g_vr_pose = 1;
             g_vr_frame = 1;
+        } else if (cfg.stereo == STEREO_WXR) {
+            double roll_r, ipd_m;
+            if (wxr_begin_frame(&yaw_r, &pitch_u, &roll_r, &ipd_m)) {
+                /* WinlatorXR places the picture at the full head pose it stored for this frame, roll included, so
+                 * roll is drawn (the engine's bank; roll_sign flips it if it turns the wrong way). */
+                g_yaw = to_units(yaw_r * cfg.yaw_sign);
+                g_pitch = to_units(pitch_u * cfg.pitch_sign);
+                g_roll = cfg.wxr_roll ? to_units(roll_r * cfg.roll_sign) : 0;
+                g_ipd = (float)(ipd_m / 0.3048 * cfg.wxr_ipd_scale);   /* 1 game unit = 1 foot */
+                g_vr_pose = 1;
+                g_vr_frame = 1;
+            }
         }
         if (g_vr_frame && g_viewscale && g_horplus) {
             /* Widen the engine's view to fill the headset: write its view scale for this frame only (restored
@@ -907,6 +973,13 @@ static void __cdecl hl_scene(void)
             g_engine_scale = engine_scale;
             if (!(zoom > 0.05f && zoom < 50.0f)) zoom = 1.0f;
             g_vr_horplus = *g_horplus;
+            if (cfg.stereo == STEREO_WXR) {
+                IDirect3DSurface9 *bb = NULL;
+                D3DSURFACE_DESC bd;
+                memset(&bd, 0, sizeof bd);
+                if (SUCCEEDED(IDirect3DDevice9_GetBackBuffer(dev, 0, 0, D3DBACKBUFFER_TYPE_MONO, &bb)) && bb) { IDirect3DSurface9_GetDesc(bb, &bd); IDirect3DSurface9_Release(bb); }
+                g_vr_scale = cfg.vr_view_scale > 0 ? (float)cfg.vr_view_scale : wxr_view_scale(g_vr_horplus, bd.Width, bd.Height, (float)cfg.wxr_fov);
+            } else
             g_vr_scale = cfg.vr_view_scale > 0 ? (float)cfg.vr_view_scale : vr_auto_scale(g_vr_horplus);
             *g_viewscale = g_vr_scale / zoom;
             stereo_frame(dev, cam);      /* draws both eyes, including the reference marks in each */
@@ -958,6 +1031,17 @@ static int install_stereo(void)
     hl_log("scene-call wrapper installed at %p (stereo and/or reference marks); device slot %p", (void *)site, (void *)g_dev_slot);
     return 1;
 }
+
+/* For the controller DLL (xinput_joy's dinput.dll): the Quest Touch controllers as an Xbox pad (XINPUT_STATE).
+ * Returns 0 when not in WinlatorXR mode, 1 with fresh data, 2 in WinlatorXR mode without data yet (out neutral). */
+__declspec(dllexport) int __cdecl headlook_xr_pad(void *xinput_state)
+{
+    if (cfg.stereo != STEREO_WXR) return 0;
+    return wxr_xinput(xinput_state) ? 1 : 2;
+}
+
+/* For the backends' own dumps (vr_wxr.c): same files and numbering as the stereo diagnostic. */
+void hl_dump_surface(IDirect3DDevice9 *dev, IDirect3DSurface9 *src, const char *name) { dump_surface(dev, src, name); }
 
 /* ------------------------------------------------------------------ tracking data */
 
@@ -1055,7 +1139,7 @@ static void periodic(void)
         g_fov_deg = (float)cfg.fov_deg;
         next_reload = now + 2000;
     }
-    if (cfg.stereo == STEREO_OPENVR) {                /* HUD panel show/hide: vr_hud_key (default H) or vr_hud_pad (default Y) */
+    if (cfg.stereo == STEREO_OPENVR || cfg.stereo == STEREO_WXR) {   /* HUD show/hide: vr_hud_key (default H) or vr_hud_pad (default Y) */
         static int tog_was_down;
         int down = (cfg.vr_hud_key && (GetAsyncKeyState(cfg.vr_hud_key) & 0x8000)) ||
                    (cfg.vr_hud_pad && (vr_pad_buttons() & (unsigned)cfg.vr_hud_pad) == (unsigned)cfg.vr_hud_pad);
@@ -1070,6 +1154,7 @@ static void periodic(void)
         int down = (GetAsyncKeyState(VK_INSERT) & 0x8000) != 0;
         if (down && !ins_was_down && g_stereo_on) {
             g_dump_key = 1;
+            if (cfg.stereo == STEREO_WXR) wxr_request_dump();
             if (cfg.stereo == STEREO_OPENVR) vr_hud_request_dump();
             hl_log("stereo diagnostic requested (Insert key)");
         }
@@ -1082,10 +1167,15 @@ static void periodic(void)
             DeleteFileA(p);
             hl_log("stereo diagnostic requested (%s)", g_stereo_on ? "will run on the next stereo frame" : "but stereo is not active: nothing will happen");
             g_dump_req = 1;
+            if (cfg.stereo == STEREO_WXR) wxr_request_dump();
         }
         next_dump_check = now + 1000;
     }
-    if (cfg.stereo == STEREO_OPENVR && g_stereo_installed) ensure_present_hook();
+    if ((cfg.stereo == STEREO_OPENVR || cfg.stereo == STEREO_WXR) && g_stereo_installed) ensure_present_hook();
+    if (cfg.stereo == STEREO_WXR && g_stereo_installed && (int)(now - next_vr) >= 0) {
+        wxr_status();                                 /* re-sends our mode every second, logs every 5 s */
+        next_vr = now + 1000;
+    }
     if (cfg.stereo == STEREO_OPENVR && g_stereo_installed && (int)(now - next_vr) >= 0) {
         if (!vr_ready()) vr_init(g_dir);                 /* SteamVR not up at start: keep trying */
         else { vr_status(); hl_log("openvr: %lu Present calls seen by the HUD hook", g_present_calls); }
@@ -1218,11 +1308,12 @@ static DWORD WINAPI startup(LPVOID arg)
         g_fov_deg = (float)cfg.fov_deg;
         g_stereo_on = g_stereo_installed && cfg.stereo;
         g_marks_on  = g_stereo_installed && cfg.show_marks && cfg.enabled;
-        if (g_stereo_installed && cfg.stereo == STEREO_OPENVR) {
+        if (g_stereo_installed && (cfg.stereo == STEREO_OPENVR || cfg.stereo == STEREO_WXR)) {
             AddVectoredExceptionHandler(1, crash_logger);
             hook_create_device();
             install_overlay_hook();
         }
+        if (g_stereo_installed && cfg.stereo == STEREO_WXR) wxr_init(g_dir);
         if (g_stereo_installed && cfg.stereo == STEREO_OPENVR && !vr_init(g_dir))
             hl_log("openvr: not connected yet; drawing plain side-by-side and retrying every 10 s");
     }

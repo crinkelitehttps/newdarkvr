@@ -68,6 +68,8 @@ typedef struct {
                                        has no analog look/pitch bind at all, only mouselook responds to it */
     double mouselook_sensitivity;  /* pixels/poll-tick at full deflection; a rough guess, tune live */
     int mouselook_invert_y;
+    int mouselook_pitch;           /* 0 = the right stick only turns (VR: the head does the looking up/down) */
+    int xr_mode;                   /* headlook.ini says stereo=wxr (Quest via WinlatorXR): read its Touch controllers */
     int back_as_escape;            /* 1 = Back/View (select) presses Esc, instead of being joystick button joy8 */
     int rt_as_mouse1;              /* 1 = right trigger holds the left mouse button, instead of joystick button joy7 */
 } config_t;
@@ -177,6 +179,15 @@ static void load_config(void)
     cfg.mouselook_enabled      = (int)ini_double(ini, "mouselook_enabled", 1) != 0;
     cfg.mouselook_sensitivity  = ini_double(ini, "mouselook_sensitivity", 18.0);
     cfg.mouselook_invert_y     = (int)ini_double(ini, "mouselook_invert_y", 0) != 0;
+    cfg.mouselook_pitch        = (int)ini_double(ini, "mouselook_pitch", 1) != 0;
+    {   /* WinlatorXR mode, as headlook.dll decides it: HEADLOOK_STEREO, else headlook.ini's stereo key */
+        char hl[MAX_PATH + 16], st[32];
+        if (GetEnvironmentVariableA("HEADLOOK_STEREO", st, sizeof st) == 0 || !st[0]) {
+            snprintf(hl, sizeof hl, "%sheadlook.ini", g_dir);
+            GetPrivateProfileStringA("headlook", "stereo", "off", st, sizeof st, hl);
+        }
+        cfg.xr_mode = !_stricmp(st, "wxr") || !_stricmp(st, "winlatorxr") || !_stricmp(st, "quest");
+    }
     cfg.back_as_escape         = (int)ini_double(ini, "back_as_escape", 1) != 0;
     cfg.rt_as_mouse1           = (int)ini_double(ini, "rt_as_mouse1", 1) != 0;
     GetPrivateProfileStringA("xinput_joy", "shift_button", "LB", sv, sizeof sv, ini);
@@ -203,11 +214,37 @@ static void load_xinput(void)
     xj_log("no XInput DLL found (tried xinput1_4/1_3/9_1_0) -- pad will always read as unplugged");
 }
 
+/* Quest Touch controllers under WinlatorXR: headlook.dll receives them with the head pose and hands them over as
+ * an Xbox pad (its export headlook_xr_pad: 0 = not in that mode, 1 = fresh, 2 = no data yet). */
+typedef int (__cdecl *pfn_xr_pad_t)(XINPUT_STATE *);
+static pfn_xr_pad_t xr_pad_fn(void)
+{
+    static pfn_xr_pad_t fn;
+    HMODULE h;
+    if (fn) return fn;
+    if (!(h = GetModuleHandleA("headlook.dll"))) return NULL;   /* loaded later than us, by the d3d9.dll stand-in */
+    fn = (pfn_xr_pad_t)(void *)GetProcAddress(h, "headlook_xr_pad");
+    if (fn) xj_log("using headlook.dll's Quest controllers (headlook_xr_pad) when no real pad is connected");
+    return fn;
+}
+
+/* The pad state: a real XInput pad if one is connected, else (WinlatorXR mode) the Touch controllers. */
+static DWORD get_state(XINPUT_STATE *xs)
+{
+    DWORD rc = p_XInputGetState ? p_XInputGetState((DWORD)cfg.xinput_index, xs) : (DWORD)-1;
+    if (rc == ERROR_SUCCESS || !cfg.xr_mode) return rc;
+    {
+        pfn_xr_pad_t fn = xr_pad_fn();
+        memset(xs, 0, sizeof *xs);                /* no data yet: a connected pad at rest */
+        if (fn) fn(xs);
+        return ERROR_SUCCESS;
+    }
+}
+
 static BOOL pad_connected(void)
 {
     XINPUT_STATE st;
-    if (!p_XInputGetState) return FALSE;
-    return p_XInputGetState((DWORD)cfg.xinput_index, &st) == ERROR_SUCCESS;
+    return get_state(&st) == ERROR_SUCCESS;
 }
 
 /* ------------------------------------------------------------------ button bank / shift-chording */
@@ -373,6 +410,7 @@ static void inject_mouselook(double rx, double ry)
 
     dx = (LONG)(rx * cfg.mouselook_sensitivity);
     dy = (LONG)((cfg.mouselook_invert_y ? ry : -ry) * cfg.mouselook_sensitivity); /* stick up -> look up -> mouse moves up (screen -Y) by default */
+    if (!cfg.mouselook_pitch) dy = 0;
     if (dx == 0 && dy == 0) return;
     memset(&in, 0, sizeof in);
     in.type = INPUT_MOUSE;
@@ -406,7 +444,7 @@ static void device_poll_locked(XJDeviceObj *d)
     static unsigned fail_count;
     memset(&ns, 0, sizeof ns);
 
-    rc = p_XInputGetState ? p_XInputGetState((DWORD)cfg.xinput_index, &xs) : (DWORD)-1;
+    rc = get_state(&xs);
     if (rc != ERROR_SUCCESS) {
         /* Throttled diagnostic: log on every rc change and every 300th repeat (~3s at 100Hz polling),
          * so a persistent failure is visible without flooding the log at verbose 2. */
@@ -897,7 +935,7 @@ static DWORD WINAPI key_mouse_thread(LPVOID unused)
         esc_on = cfg.enabled && cfg.back_as_escape && cfg.shift_button != SB_BACK;
         m1_on = cfg.enabled && cfg.rt_as_mouse1 && cfg.shift_button != SB_RT;
         thr = cfg.trigger_threshold;
-        ok = p_XInputGetState && p_XInputGetState((DWORD)cfg.xinput_index, &xs) == ERROR_SUCCESS;
+        ok = get_state(&xs) == ERROR_SUCCESS;
         LeaveCriticalSection(&g_lock);
         front = game_in_front();
         if (ok && front) {

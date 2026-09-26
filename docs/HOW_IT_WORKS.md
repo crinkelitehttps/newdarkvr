@@ -57,15 +57,20 @@ at its true angular position, and the texture bounds select the eye's field of v
 `headlook.dll` runs as an OpenVR **scene application** (`vr_openvr.c`). Each frame:
 
 1. `WaitGetPoses` gives the head pose, and paces the game. Yaw and pitch go into the offsets from section 2.
-2. After each eye pass, the render target is copied on the GPU (`StretchRect`) into its own target. The engine's
-   16-bit float HDR target is converted to 8-bit on the way.
-3. After both passes, both are read back (`GetRenderTargetData`), run through a gamma lookup table, uploaded into
-   D3D11 textures (OpenVR takes no D3D9 textures), and `Submit`ted **with the pose they were drawn at**: yaw and
-   pitch, roll 0. The compositor's reprojection makes up the rest: head roll, and the time since `WaitGetPoses`.
+2. After each eye pass, the render target is copied on the GPU into its own target, through a small pixel shader
+   (assembled at run time with the game's own `d3dx9_43.dll`) that applies the headset brightness curve, converts
+   the engine's 16-bit float HDR picture to 8-bit and makes it opaque. Without the shader it's a `StretchRect` and
+   the curve is a CPU loop.
+3. The captured eyes are read back (`GetRenderTargetData`) **at the start of the next frame**, just after
+   `WaitGetPoses`, when the GPU has long finished them, so the CPU never waits on the GPU. They're uploaded into
+   D3D11 textures (OpenVR takes no D3D9 textures) and `Submit`ted **with the pose they were drawn at**: yaw and
+   pitch, roll 0. The compositor's reprojection makes up the rest: head roll, and the extra frame of delay. The
+   kept targets are default-pool, so a `Reset` hook (device slot 16) releases them before the engine resets its
+   device.
 4. While the game shows menus or is paused, the `Present` hook keeps submitting the last 3D frame with its
    original pose, so the world stays put in the room.
 
-That CPU round trip costs roughly 7-10 ms of a ~23 ms frame. The planned fix is to share surfaces GPU-to-GPU,
+Before the pipelining, that CPU round trip cost roughly 7-10 ms of a ~23 ms frame. Sharing surfaces GPU-to-GPU would remove it entirely,
 which needs a D3D9Ex device; the stand-in `d3d9.dll` is where that switch would go.
 
 ## 6. HUD and menus
@@ -97,7 +102,49 @@ provides a synthetic DirectInput joystick backed by XInput:
 
 The engine's data format is classic `DIJOYSTATE` (80 bytes), polled through `GetDeviceState`.
 
-## 8. Diagnostics
+## 8. Standalone headsets: WinlatorXR (`vr_wxr.c`)
+
+`stereo=wxr` makes the game the VR app inside WinlatorXR (Wine + Box64 + DXVK on a Quest or Pico). This follows the
+XrAPI v0.5, as implemented in WinlatorXR's source.
+
+**Handshake.** The game switches the API on:
+- `headlook.dll` writes `0.5` to `Z:\tmp\xr\version`.
+- It sends `L_HAP R_HAP MODE_VR MODE_3D FOVX FOVY` to UDP 7278, once at start-up, then every second and on each
+  change.
+- After that, WinlatorXR sends one text packet per headset frame to UDP 7872. It holds `client0`; per controller,
+  quaternion, stick and position; the head's quaternion, position, IPD and FOV; `HMD_SYNC`; 19 T/F buttons; and
+  more.
+
+**Frame sync.** `HMD_SYNC` steps 0, 12, … 252. WinlatorXR keeps the head pose it sent with each value.
+- We wait up to 20 ms for a new value, then draw with that pose, **roll included**.
+- At the end we paint the value as the red channel of the top-left 2x2 pixels (`ColorFill`).
+- WinlatorXR reads the pixel back and places the picture at the stored pose. Its reprojection covers the rest.
+
+**Per frame.**
+1. The existing eye passes run, and each eye is captured through the brightness-curve shader (`vr_gpu.c`).
+2. The HUD overlays are drawn once, onto the cleared scene target, as in the SteamVR mode. So at `Present` the back
+   buffer holds the HUD and text over black.
+3. At `Present`, that HUD is copied aside and the two eyes are put side by side into the back buffer.
+4. The HUD is drawn into each half with a premultiplied-alpha shader (black is see-through), at `vr_hud_dist` and
+   offset by half the IPD for depth.
+5. The sync pixel is painted last.
+
+**Menus, books and loading screens** use `MODE_VR 2`, WinlatorXR's own flat screen.
+
+**Field of view.** The engine's picture always has the back buffer's shape, so each eye is drawn full-size and
+squeezed into half the width. The view scale is chosen to cover the headset's own FOV (learned from packets while we
+send FOV 0). The FOV actually drawn is what's sent back.
+
+**Controllers.** `headlook.dll` exports `headlook_xr_pad`, which returns the Touch controllers as an Xbox pad state:
+- A/B/X/Y as labelled.
+- Grips = LB/RB, triggers = LT/RT, stick clicks = L3/R3.
+- The left menu button is left out, because WinlatorXR always turns it into Esc.
+
+`dinput.dll` uses it when no real pad is connected. Its WinlatorXR check (`stereo=wxr` in `headlook.ini`) makes it
+report a joystick at start-up, before `headlook.dll` is loaded. The Quest binds are in `tools/quest/thief2vr_quest.bnd`.
+The launcher appends them to `user.bnd` once.
+
+## 9. Diagnostics
 
 - **Logs**, next to the DLLs: `headlook.log` records the hooks, OpenVR state, and per-stage timing every 5 s.
   `d3d9proxy.log` and `dinput.log` cover the other two DLLs.

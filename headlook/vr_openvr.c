@@ -36,6 +36,8 @@
 #define OPENVR_API_NODLL
 #include <openvr_capi.h>
 #include "vr_openvr.h"
+#include "vr_gpu.h"
+#include "vr_wxr.h"
 
 void hl_log(const char *fmt, ...);
 
@@ -95,6 +97,8 @@ static const char *volatile g_step = "idle";
 static volatile DWORD g_step_since;
 static unsigned long g_prof_frames;               /* frames in the current timing interval (see vr_status) */
 static void release_caps(void);
+static void submit_caps(IDirect3DDevice9 *dev);
+static int g_cap_done, g_pending;
 static unsigned long g_traced;                    /* frames started (WaitGetPoses calls); the first TRACE_FRAMES are traced */
 #define TRACE_FRAMES 3
 
@@ -228,7 +232,8 @@ unsigned vr_pad_buttons(void)
         get = x ? (DWORD (WINAPI *)(DWORD, pad_state_t *))(void *)GetProcAddress(x, "XInputGetState") : NULL;
         hl_log("openvr: controller buttons (recentre L3+R3, HUD toggle) %s", get ? "available" : "unavailable (no XInput)");
     }
-    if (!get) return 0;
+    all = wxr_pad_buttons();                      /* Quest Touch controllers under WinlatorXR, as Xbox buttons */
+    if (!get) return all;
     for (i = 0; i < 4; i++) {
         pad_state_t st;
         if (get(i, &st) == 0) all |= st.buttons;
@@ -247,20 +252,15 @@ static void poll_recentre_keys(void)
     g_key_was_down = down;
 }
 
-int vr_begin_frame(double *yaw_right_deg, double *pitch_up_deg)
+int vr_begin_frame(IDirect3DDevice9 *dev, double *yaw_right_deg, double *pitch_up_deg)
 {
     TrackedDevicePose_t poses[1];
     EVRCompositorError e;
     double yaw, pitch;
 
     if (!vr_ready()) return 0;
-    {
-        static double last;
-        double now = vr_ms();
-        if (last > 0 && now - last < 1000) { vr_prof(P_FRAME, now - last); g_prof_frames++; }
-        last = now;
-    }
-    release_caps();                                   /* a frame that never reached vr_end_frame */
+    vr_prof_tick();
+    g_cap_done = 0;                                   /* a frame that never reached vr_end_frame */
     g_have_pose = 0;
     g_traced++;
     step("PollNextEvent");
@@ -279,9 +279,13 @@ int vr_begin_frame(double *yaw_right_deg, double *pitch_up_deg)
     if (e != EVRCompositorError_VRCompositorError_None) {
         if ((int)e != g_last_wait_err) hl_log("openvr: WaitGetPoses error %d", (int)e);
         g_last_wait_err = (int)e;
+        g_pending = 0;
         return 0;
     }
     g_last_wait_err = 0;
+    /* Pipelined: the previous frame's eyes were left on the GPU; it has finished them by now, so the readback
+     * doesn't stall. They go out with the pose they were drawn at, and the compositor reprojects the difference. */
+    if (g_pending) { g_pending = 0; submit_caps(dev); }
     if (!poses[0].bPoseIsValid) return 0;
 
     poll_recentre_keys();
@@ -416,15 +420,46 @@ double vr_ms(void)
     return (double)c.QuadPart * 1000.0 / (double)f.QuadPart;
 }
 void vr_prof(int k, double ms) { if (k >= 0 && k < P_N) g_prof[k] += ms; }
+void vr_prof_tick(void)                           /* render thread, once per 3D frame: the frame-to-frame time */
+{
+    static double last;
+    double now = vr_ms();
+    if (last > 0 && now - last < 1000) { vr_prof(P_FRAME, now - last); g_prof_frames++; }
+    last = now;
+}
+void vr_prof_report(const char *tag)              /* worker: log the averages since the last report, then reset */
+{
+    char buf[512];
+    int k, o;
+    double sum = 0, n = (double)g_prof_frames;
+    if (g_prof_frames == 0) return;
+    o = snprintf(buf, sizeof buf, "%s: timing, ms per frame over %lu frames (%.1f fps):", tag, g_prof_frames, 1000.0 * n / (g_prof[P_FRAME] > 0 ? g_prof[P_FRAME] : 1));
+    for (k = 0; k < P_N && o < (int)sizeof buf - 40; k++) {
+        o += snprintf(buf + o, sizeof buf - o, " %s %.1f", g_prof_names[k], g_prof[k] / n);
+        if (k != P_FRAME) sum += g_prof[k];
+    }
+    snprintf(buf + o, sizeof buf - o, " | other %.1f", (g_prof[P_FRAME] - sum) / n);
+    hl_log("%s", buf);
+    memset(g_prof, 0, sizeof g_prof);
+    g_prof_frames = 0;
+}
 
-/* ---- Eye capture. After each pass the eye is copied on the GPU (StretchRect) into its own render target,
- * converted from the engine's 16-bit float HDR target to 8-bit if the driver can (half the bytes to copy, and
- * the same clamp the compositor would apply). Both are read back together after the second pass, so the CPU no
- * longer waits for the GPU between the two eyes. The capture targets are default-pool, so they are made and
- * released within the frame (one outliving it would make the engine's device Reset fail). */
+/* ---- Eye capture. After each pass the eye is copied on the GPU into its own render target: through a small pixel
+ * shader that applies the brightness curve and makes it opaque 8-bit (vr_gpu_gamma), or with StretchRect, converting
+ * the engine's 16-bit float HDR target to 8-bit if the driver can. Pipelined (vr_pipeline), the targets are read
+ * back at the next frame's vr_begin_frame, when the GPU is long done with them, instead of stalling right after the
+ * second pass. The targets are default-pool, so they are kept only while 3D frames keep coming and are released at
+ * the device's Reset (vr_device_reset) and in menus: one outliving a Reset would make the engine's Reset fail. */
 static IDirect3DSurface9 *g_cap[2];
+static D3DSURFACE_DESC g_cap_desc[2];
+static int g_cap_clean[2];                        /* went through the shader: curve applied, alpha already 1 */
+static HmdMatrix34_t g_pend_pose;                 /* what the captured frame was drawn with */
+static HmdMatrix34_t g_tex_pose;                  /* ... and what the eye textures now hold (idle frames resend it) */
+static float g_pend_scale;
+static int g_pend_horplus, g_pend_hdr;
 static D3DFORMAT g_conv_src;                      /* source format the conversion check was made for */
 static int g_conv_ok;
+static float g_lut_gamma = -1, g_lut_black = -1;
 
 static D3DFORMAT capture_format(IDirect3DDevice9 *dev, D3DFORMAT src, int convert)
 {
@@ -448,28 +483,48 @@ static void release_caps(void)
 {
     int i;
     for (i = 0; i < 2; i++) if (g_cap[i]) { IDirect3DSurface9_Release(g_cap[i]); g_cap[i] = NULL; }
+    vr_gpu_reset();
+    g_cap_done = 0;
+    g_pending = 0;
 }
 
-void vr_capture_eye(IDirect3DDevice9 *dev, IDirect3DSurface9 *src, int eye, int convert)
+void vr_capture_eye(IDirect3DDevice9 *dev, IDirect3DSurface9 *src, int eye, int convert, int gpu_curve)
 {
     D3DSURFACE_DESC d;
     D3DFORMAT cf;
     HRESULT hr;
+    int use_ps;
     double t0 = vr_ms();
 
     if (!vr_ready() || !g_have_pose || eye < 0 || eye > 1) return;
     IDirect3DSurface9_GetDesc(src, &d);
-    cf = capture_format(dev, d.Format, convert);
-    if (g_cap[eye]) { IDirect3DSurface9_Release(g_cap[eye]); g_cap[eye] = NULL; }
+    /* The shader writes 8-bit: not when the 16-bit picture was asked for (vr_gpu_convert 0). */
+    use_ps = gpu_curve && (convert || d.Format != D3DFMT_A16B16G16R16F) && vr_curve_available(dev);
+    cf = use_ps ? D3DFMT_A8R8G8B8 : capture_format(dev, d.Format, convert);
+    if (g_cap[eye] && (g_cap_desc[eye].Width != d.Width || g_cap_desc[eye].Height != d.Height || g_cap_desc[eye].Format != cf)) {
+        IDirect3DSurface9_Release(g_cap[eye]); g_cap[eye] = NULL;
+    }
     step("capture");
-    hr = IDirect3DDevice9_CreateRenderTarget(dev, d.Width, d.Height, cf, D3DMULTISAMPLE_NONE, 0, FALSE, &g_cap[eye], NULL);
-    if (SUCCEEDED(hr) && g_cap[eye]) hr = IDirect3DDevice9_StretchRect(dev, src, NULL, g_cap[eye], NULL, D3DTEXF_NONE);
+    hr = S_OK;
+    if (!g_cap[eye]) {
+        hr = IDirect3DDevice9_CreateRenderTarget(dev, d.Width, d.Height, cf, D3DMULTISAMPLE_NONE, 0, FALSE, &g_cap[eye], NULL);
+        if (SUCCEEDED(hr) && g_cap[eye]) { g_cap_desc[eye] = d; g_cap_desc[eye].Format = cf; }
+    }
+    if (SUCCEEDED(hr) && g_cap[eye]) {
+        if (use_ps) {
+            if (!vr_curve_copy(dev, src, g_cap[eye], g_lut_gamma > 0 ? g_lut_gamma : 1.0f, g_lut_black > 0 ? g_lut_black : 0.0f))
+                hr = E_FAIL;                          /* back to StretchRect + the CPU curve from the next frame */
+        } else hr = IDirect3DDevice9_StretchRect(dev, src, NULL, g_cap[eye], NULL, D3DTEXF_NONE);
+    }
     step("idle");
     if (FAILED(hr) || !g_cap[eye]) {
         if (g_errs++ < 5) hl_log("openvr: capture (eye %d, format %d -> %d) failed: %#lx%s", eye, (int)d.Format, (int)cf, (unsigned long)hr,
-                                 cf != d.Format ? "; turning the 8-bit conversion off" : "");
-        if (cf != d.Format) g_conv_ok = 0;
+                                 !use_ps && cf != d.Format ? "; turning the 8-bit conversion off" : "");
+        if (!use_ps && cf != d.Format) g_conv_ok = 0;
         if (g_cap[eye]) { IDirect3DSurface9_Release(g_cap[eye]); g_cap[eye] = NULL; }
+    } else {
+        g_cap_done |= 1 << eye;
+        g_cap_clean[eye] = use_ps;
     }
     vr_prof(P_CAPTURE, vr_ms() - t0);
 }
@@ -478,7 +533,6 @@ void vr_capture_eye(IDirect3DDevice9 *dev, IDirect3DSurface9 *src, int eye, int 
  * before the engine's own final colour correction (d3d_disp_sw_cc: the game's gamma/brightness settings apply
  * only to what reaches the monitor), and cheap headsets crush dark greys, so this is ours to set. */
 static unsigned char g_lut[256];
-static float g_lut_gamma = -1, g_lut_black = -1;
 static int g_lut_identity = 1;
 void vr_set_picture(float gamma, float black)
 {
@@ -497,7 +551,8 @@ void vr_set_picture(float gamma, float black)
     hl_log("openvr: eye picture curve: gamma %.2f, black level %.2f", gamma, black);
 }
 
-static int submit_one(IDirect3DDevice9 *dev, IDirect3DSurface9 *src, int eye, float scale, int horplus, int hdr_linear)
+static int submit_one(IDirect3DDevice9 *dev, IDirect3DSurface9 *src, int eye, float scale, int horplus, int hdr_linear, int clean,
+                      const HmdMatrix34_t *pose)
 {
     const fmt_t *fm;
     D3DSURFACE_DESC d;
@@ -540,7 +595,7 @@ static int submit_one(IDirect3DDevice9 *dev, IDirect3DSurface9 *src, int eye, fl
     if (FAILED(IDirect3DSurface9_LockRect(g_sysmem, &lr, NULL, 0))) { if (g_errs++ < 5) hl_log("openvr: LockRect failed"); return 0; }
     vr_prof(P_READBACK, vr_ms() - t);
     t = vr_ms();
-    for (y = 0; y < d.Height; y++) {                   /* X8 bytes may be 0, float alpha anything: make every pixel opaque */
+    for (y = 0; y < d.Height && !(clean && fm->bpp == 4); y++) {   /* X8 bytes may be 0, float alpha anything: make every pixel opaque */
         unsigned char *row = (unsigned char *)lr.pBits + (size_t)y * (size_t)lr.Pitch;
         if (fm->bpp == 4 && g_lut_identity) { UINT32 *px = (UINT32 *)row; for (x = 0; x < d.Width; x++) px[x] |= 0xFF000000u; }
         else if (fm->bpp == 4) {
@@ -569,7 +624,7 @@ static int submit_one(IDirect3DDevice9 *dev, IDirect3DSurface9 *src, int eye, fl
     /* Whether the engine's HDR buffer holds gamma-encoded or linear values is not known; ini vr_hdr_linear
      * switches (live) if the float picture looks washed out or too dark. 8-bit is always gamma. */
     tex.eColorSpace = fm->bpp == 8 && hdr_linear ? EColorSpace_ColorSpace_Linear : EColorSpace_ColorSpace_Gamma;
-    tex.mDeviceToAbsoluteTracking = g_drawn_pose;
+    tex.mDeviceToAbsoluteTracking = *pose;
     t = vr_ms();
     step(eye ? "Submit (right)" : "Submit (left)");
     e = g_comp->Submit((EVREye)eye, (struct Texture_t *)&tex, &g_bounds[eye], EVRSubmitFlags_Submit_TextureWithPose);
@@ -586,13 +641,13 @@ static int submit_one(IDirect3DDevice9 *dev, IDirect3DSurface9 *src, int eye, fl
     return 1;
 }
 
-/* After both passes: read back, upload and submit both captured eyes, then hand the frame to the compositor. */
-void vr_end_frame(IDirect3DDevice9 *dev, float scale, int horplus, int hdr_linear)
+/* Read back, upload and submit both captured eyes with the pose they were drawn at, then hand the frame over. */
+static void submit_caps(IDirect3DDevice9 *dev)
 {
     int eye, n = 0;
     for (eye = 0; eye < 2; eye++)
-        if (g_cap[eye]) n += submit_one(dev, g_cap[eye], eye, scale, horplus, hdr_linear);
-    release_caps();
+        if (g_cap[eye]) n += submit_one(dev, g_cap[eye], eye, g_pend_scale, g_pend_horplus, g_pend_hdr, g_cap_clean[eye], &g_pend_pose);
+    g_tex_pose = g_pend_pose;
     if (n == 2) {
         double t = vr_ms();
         step("PostPresentHandoff");
@@ -600,6 +655,18 @@ void vr_end_frame(IDirect3DDevice9 *dev, float scale, int horplus, int hdr_linea
         step("idle");
         vr_prof(P_SUBMIT, vr_ms() - t);
     }
+}
+
+/* After both passes: submit now, or leave the eyes on the GPU for the next vr_begin_frame (pipeline). */
+void vr_end_frame(IDirect3DDevice9 *dev, float scale, int horplus, int hdr_linear, int pipeline)
+{
+    int done = g_cap_done;
+    g_cap_done = 0;
+    if (done != 3) return;
+    g_pend_pose = g_drawn_pose;
+    g_pend_scale = scale; g_pend_horplus = horplus; g_pend_hdr = hdr_linear;
+    if (pipeline) { g_pending = 1; return; }
+    submit_caps(dev);
 }
 
 /* ---- HUD / menu panel: a head-locked OpenVR overlay showing the game's back buffer. Render thread (Present). */
@@ -616,6 +683,9 @@ static int g_menu_pose_ok;                        /* ... from a valid pose */
 static DWORD g_menu_away_since;                   /* when the head turned well away from it (0 = it's in view) */
 static vr_hud_cfg_t g_hud_placed;                 /* the settings it was placed with */
 static unsigned long g_hud_frames, g_hud_presents;
+static IDirect3DSurface9 *g_hud_rt;              /* pipelined: GPU copy of the back buffer, read at the next Present */
+static D3DSURFACE_DESC g_hud_rt_desc;
+static int g_hud_pending, g_hud_pend_ingame;
 static volatile int g_hud_dump;                   /* write the next panel image to hud_panel_N.bmp */
 static unsigned g_hud_dump_no;
 
@@ -666,9 +736,9 @@ static void write_bmp32(const char *path, const unsigned char *bits, int pitch, 
     fclose(f);
 }
 
-void vr_hud_present(IDirect3DDevice9 *dev, int in_game, const vr_hud_cfg_t *c)
+/* Read a copy of the back buffer (bb) back, make black see-through in a mission, and put it on the panel. */
+static void hud_upload(IDirect3DDevice9 *dev, IDirect3DSurface9 *bb, int in_game)
 {
-    IDirect3DSurface9 *bb = NULL;
     D3DSURFACE_DESC d;
     D3DLOCKED_RECT lr;
     Texture_t tex;
@@ -676,11 +746,71 @@ void vr_hud_present(IDirect3DDevice9 *dev, int in_game, const vr_hud_cfg_t *c)
     HRESULT hr;
     EVROverlayError oe;
 
+    IDirect3DSurface9_GetDesc(bb, &d);
+    if (!g_hud_sys || g_hud_sys_desc.Width != d.Width || g_hud_sys_desc.Height != d.Height || g_hud_sys_desc.Format != d.Format) {
+        if (g_hud_sys) { IDirect3DSurface9_Release(g_hud_sys); g_hud_sys = NULL; }
+        hr = IDirect3DDevice9_CreateOffscreenPlainSurface(dev, d.Width, d.Height, d.Format, D3DPOOL_SYSTEMMEM, &g_hud_sys, NULL);
+        if (FAILED(hr) || !g_hud_sys) { g_hud_sys = NULL; return; }
+        g_hud_sys_desc = d;
+    }
+    if (!g_hud_tex || g_hud_w != d.Width || g_hud_h != d.Height) {
+        D3D11_TEXTURE2D_DESC td;
+        if (g_hud_tex) { ID3D11Texture2D_Release(g_hud_tex); g_hud_tex = NULL; }
+        memset(&td, 0, sizeof td);
+        td.Width = d.Width; td.Height = d.Height; td.MipLevels = 1; td.ArraySize = 1;
+        td.Format = DXGI_FORMAT_B8G8R8A8_UNORM; td.SampleDesc.Count = 1;
+        td.Usage = D3D11_USAGE_DEFAULT; td.BindFlags = D3D11_BIND_SHADER_RESOURCE;
+        if (FAILED(ID3D11Device_CreateTexture2D(g_d11, &td, NULL, &g_hud_tex))) { g_hud_tex = NULL; return; }
+        g_hud_w = d.Width; g_hud_h = d.Height;
+        hl_log("openvr: HUD panel texture %ux%u", d.Width, d.Height);
+    }
+    hr = IDirect3DDevice9_GetRenderTargetData(dev, bb, g_hud_sys);
+    if (FAILED(hr)) { if (g_errs++ < 5) hl_log("openvr: HUD GetRenderTargetData failed: %#lx", (unsigned long)hr); return; }
+    if (FAILED(IDirect3DSurface9_LockRect(g_hud_sys, &lr, NULL, 0))) return;
+    for (y = 0; y < d.Height; y++) {
+        UINT32 *px = (UINT32 *)((unsigned char *)lr.pBits + (size_t)y * (size_t)lr.Pitch);
+        if (!in_game) { for (x = 0; x < d.Width; x++) px[x] |= 0xFF000000u; continue; }   /* menus: opaque */
+        /* HUD over black: black is see-through; anything else is (nearly) solid, so dark HUD parts such as a
+         * dim light gem still show. Alpha = 4 x the brightest channel, premultiplied (colour <= alpha holds). */
+        for (x = 0; x < d.Width; x++) {
+            UINT32 v = px[x], r = (v >> 16) & 255, g = (v >> 8) & 255, b = v & 255, a = r > g ? r : g;
+            if (b > a) a = b;
+            a *= 4;
+            if (a > 255) a = 255;
+            px[x] = (v & 0x00FFFFFFu) | (a << 24);
+        }
+    }
+    if (g_hud_dump) {
+        char path[MAX_PATH + 40];
+        g_hud_dump = 0;
+        snprintf(path, sizeof path, "%shud_panel_%u.bmp", g_dir_vr, ++g_hud_dump_no);
+        write_bmp32(path, (const unsigned char *)lr.pBits, lr.Pitch, d.Width, d.Height);
+        hl_log("openvr: wrote hud_panel_%u.bmp (%ux%u, %s)", g_hud_dump_no, d.Width, d.Height, in_game ? "in-game HUD" : "menu");
+    }
+    ID3D11DeviceContext_UpdateSubresource(g_ctx, (ID3D11Resource *)g_hud_tex, 0, NULL, lr.pBits, (UINT)lr.Pitch, 0);
+    IDirect3DSurface9_UnlockRect(g_hud_sys);
+    ID3D11DeviceContext_Flush(g_ctx);
+    tex.handle = g_hud_tex; tex.eType = ETextureType_TextureType_DirectX; tex.eColorSpace = EColorSpace_ColorSpace_Gamma;
+    oe = g_ovl->SetOverlayTexture(g_hud, &tex);
+    if (oe != 0 && g_errs++ < 5) hl_log("openvr: SetOverlayTexture failed: %d", (int)oe);
+    if (!g_hud_shown) { g_ovl->ShowOverlay(g_hud); g_hud_shown = 1; }
+    g_hud_frames++;
+}
+
+void vr_hud_present(IDirect3DDevice9 *dev, int in_game, const vr_hud_cfg_t *c)
+{
+    IDirect3DSurface9 *bb = NULL;
+    D3DSURFACE_DESC d;
+    HRESULT hr;
+    EVROverlayError oe;
+    int due;
+
     if (!vr_ready() || !g_ovl || g_hud_state < 0) return;
     g_hud_presents++;
     /* In a mission the panel only carries the HUD: refreshing it every Nth frame saves most of its cost (a
      * second GPU->CPU copy). Menus get every frame (nothing else to draw then, and the cursor stays smooth). */
-    if (in_game && c->every > 1 && g_hud_presents % (unsigned long)c->every != 0 && !g_hud_dump && g_hud_mode == 1) return;
+    due = !(in_game && c->every > 1 && g_hud_presents % (unsigned long)c->every != 0 && !g_hud_dump && g_hud_mode == 1);
+    if (!due && !g_hud_pending) return;
     if (!g_d11 && !g_d11_failed) { if (!make_d3d11()) g_d11_failed = 1; }
     if (!g_d11) return;
     if (g_hud_state == 0) {
@@ -749,6 +879,8 @@ void vr_hud_present(IDirect3DDevice9 *dev, int in_game, const vr_hud_cfg_t *c)
         g_hud_placed = *c;
     }
 
+    if (g_hud_pending) { g_hud_pending = 0; hud_upload(dev, g_hud_rt, g_hud_pend_ingame); }
+    if (!due) return;
     if (FAILED(IDirect3DDevice9_GetBackBuffer(dev, 0, 0, D3DBACKBUFFER_TYPE_MONO, &bb)) || !bb) return;
     IDirect3DSurface9_GetDesc(bb, &d);
     if (d.Format != D3DFMT_X8R8G8B8 && d.Format != D3DFMT_A8R8G8B8) {
@@ -756,55 +888,23 @@ void vr_hud_present(IDirect3DDevice9 *dev, int in_game, const vr_hud_cfg_t *c)
         IDirect3DSurface9_Release(bb);
         return;
     }
-    if (!g_hud_sys || g_hud_sys_desc.Width != d.Width || g_hud_sys_desc.Height != d.Height || g_hud_sys_desc.Format != d.Format) {
-        if (g_hud_sys) { IDirect3DSurface9_Release(g_hud_sys); g_hud_sys = NULL; }
-        hr = IDirect3DDevice9_CreateOffscreenPlainSurface(dev, d.Width, d.Height, d.Format, D3DPOOL_SYSTEMMEM, &g_hud_sys, NULL);
-        if (FAILED(hr) || !g_hud_sys) { g_hud_sys = NULL; IDirect3DSurface9_Release(bb); return; }
-        g_hud_sys_desc = d;
-    }
-    if (!g_hud_tex || g_hud_w != d.Width || g_hud_h != d.Height) {
-        D3D11_TEXTURE2D_DESC td;
-        if (g_hud_tex) { ID3D11Texture2D_Release(g_hud_tex); g_hud_tex = NULL; }
-        memset(&td, 0, sizeof td);
-        td.Width = d.Width; td.Height = d.Height; td.MipLevels = 1; td.ArraySize = 1;
-        td.Format = DXGI_FORMAT_B8G8R8A8_UNORM; td.SampleDesc.Count = 1;
-        td.Usage = D3D11_USAGE_DEFAULT; td.BindFlags = D3D11_BIND_SHADER_RESOURCE;
-        if (FAILED(ID3D11Device_CreateTexture2D(g_d11, &td, NULL, &g_hud_tex))) { g_hud_tex = NULL; IDirect3DSurface9_Release(bb); return; }
-        g_hud_w = d.Width; g_hud_h = d.Height;
-        hl_log("openvr: HUD panel texture %ux%u", d.Width, d.Height);
-    }
-    hr = IDirect3DDevice9_GetRenderTargetData(dev, bb, g_hud_sys);
-    IDirect3DSurface9_Release(bb);
-    if (FAILED(hr)) { if (g_errs++ < 5) hl_log("openvr: HUD GetRenderTargetData failed: %#lx", (unsigned long)hr); return; }
-    if (FAILED(IDirect3DSurface9_LockRect(g_hud_sys, &lr, NULL, 0))) return;
-    for (y = 0; y < d.Height; y++) {
-        UINT32 *px = (UINT32 *)((unsigned char *)lr.pBits + (size_t)y * (size_t)lr.Pitch);
-        if (!in_game) { for (x = 0; x < d.Width; x++) px[x] |= 0xFF000000u; continue; }   /* menus: opaque */
-        /* HUD over black: black is see-through; anything else is (nearly) solid, so dark HUD parts such as a
-         * dim light gem still show. Alpha = 4 x the brightest channel, premultiplied (colour <= alpha holds). */
-        for (x = 0; x < d.Width; x++) {
-            UINT32 v = px[x], r = (v >> 16) & 255, g = (v >> 8) & 255, b = v & 255, a = r > g ? r : g;
-            if (b > a) a = b;
-            a *= 4;
-            if (a > 255) a = 255;
-            px[x] = (v & 0x00FFFFFFu) | (a << 24);
+    if (c->pipeline) {                            /* copy on the GPU now; read it back next Present, when it's done */
+        if (g_hud_rt && (g_hud_rt_desc.Width != d.Width || g_hud_rt_desc.Height != d.Height || g_hud_rt_desc.Format != d.Format)) {
+            IDirect3DSurface9_Release(g_hud_rt); g_hud_rt = NULL;
+        }
+        if (!g_hud_rt) {
+            hr = IDirect3DDevice9_CreateRenderTarget(dev, d.Width, d.Height, d.Format, D3DMULTISAMPLE_NONE, 0, FALSE, &g_hud_rt, NULL);
+            if (FAILED(hr) || !g_hud_rt) g_hud_rt = NULL; else g_hud_rt_desc = d;
+        }
+        if (g_hud_rt && SUCCEEDED(IDirect3DDevice9_StretchRect(dev, bb, NULL, g_hud_rt, NULL, D3DTEXF_NONE))) {
+            g_hud_pending = 1;
+            g_hud_pend_ingame = in_game;
+            IDirect3DSurface9_Release(bb);
+            return;
         }
     }
-    if (g_hud_dump) {
-        char path[MAX_PATH + 40];
-        g_hud_dump = 0;
-        snprintf(path, sizeof path, "%shud_panel_%u.bmp", g_dir_vr, ++g_hud_dump_no);
-        write_bmp32(path, (const unsigned char *)lr.pBits, lr.Pitch, d.Width, d.Height);
-        hl_log("openvr: wrote hud_panel_%u.bmp (%ux%u, %s)", g_hud_dump_no, d.Width, d.Height, in_game ? "in-game HUD" : "menu");
-    }
-    ID3D11DeviceContext_UpdateSubresource(g_ctx, (ID3D11Resource *)g_hud_tex, 0, NULL, lr.pBits, (UINT)lr.Pitch, 0);
-    IDirect3DSurface9_UnlockRect(g_hud_sys);
-    ID3D11DeviceContext_Flush(g_ctx);
-    tex.handle = g_hud_tex; tex.eType = ETextureType_TextureType_DirectX; tex.eColorSpace = EColorSpace_ColorSpace_Gamma;
-    oe = g_ovl->SetOverlayTexture(g_hud, &tex);
-    if (oe != 0 && g_errs++ < 5) hl_log("openvr: SetOverlayTexture failed: %d", (int)oe);
-    if (!g_hud_shown) { g_ovl->ShowOverlay(g_hud); g_hud_shown = 1; }
-    g_hud_frames++;
+    hud_upload(dev, bb, in_game);                 /* not pipelined, or the GPU copy failed */
+    IDirect3DSurface9_Release(bb);
 }
 
 /* Menus, loading, paused: the game draws no 3D view, so without this SteamVR gets no frames from us at all and
@@ -813,16 +913,16 @@ void vr_hud_present(IDirect3DDevice9 *dev, int in_game, const vr_hud_cfg_t *c)
  * put in the room), or black before the first map. */
 static ID3D11Texture2D *g_black;
 static unsigned long g_idle_frames;
-void vr_idle_frame(void)
+void vr_idle_frame(IDirect3DDevice9 *dev)
 {
     TrackedDevicePose_t p;
     int eye;
     if (!vr_ready()) return;
     /* Only once a 3D frame exists: sending black frames from launch made SteamVR open its dashboard ("Resume
      * game"), presumably when the frames then stopped while the first map loaded (user report 2026-09-25). */
-    if (!g_tex[0] || !g_tex[1]) return;
+    if (!g_tex[0] || !g_tex[1]) { release_caps(); return; }
     if (!g_d11 && !g_d11_failed) { if (!make_d3d11()) g_d11_failed = 1; }
-    if (!g_d11) return;
+    if (!g_d11) { release_caps(); return; }
     if (!g_black) {
         static UINT32 px[16 * 16];
         D3D11_TEXTURE2D_DESC td;
@@ -836,15 +936,22 @@ void vr_idle_frame(void)
         if (FAILED(ID3D11Device_CreateTexture2D(g_d11, &td, &init, &g_black))) { g_black = NULL; return; }
     }
     poll_events();
-    if (g_quit) return;
+    if (g_quit) { release_caps(); return; }
     poll_recentre_keys();
-    if (g_comp->WaitGetPoses(&p, 1, NULL, 0) != EVRCompositorError_VRCompositorError_None) return;
+    if (g_comp->WaitGetPoses(&p, 1, NULL, 0) != EVRCompositorError_VRCompositorError_None) { release_caps(); return; }
+    if (g_pending) {                              /* the last 3D frame, still on the GPU (pipelined): send it first */
+        g_pending = 0;
+        submit_caps(dev);
+        release_caps();                               /* no default-pool surfaces left lying around in menus (device Reset) */
+        return;
+    }
+    release_caps();
     for (eye = 0; eye < 2; eye++) {
         if (g_tex[eye]) {
             VRTextureWithPose_t t;
             memset(&t, 0, sizeof t);
             t.handle = g_tex[eye]; t.eType = ETextureType_TextureType_DirectX; t.eColorSpace = EColorSpace_ColorSpace_Gamma;
-            t.mDeviceToAbsoluteTracking = g_drawn_pose;
+            t.mDeviceToAbsoluteTracking = g_tex_pose;
             g_comp->Submit((EVREye)eye, (struct Texture_t *)&t, &g_bounds[eye], EVRSubmitFlags_Submit_TextureWithPose);
         } else {
             Texture_t t;
@@ -856,6 +963,16 @@ void vr_idle_frame(void)
     if (g_idle_frames++ == 0) hl_log("openvr: sending idle frames while the game shows menus (%s)", g_tex[0] ? "last 3D frame" : "black");
 }
 
+/* Render thread, just before the engine's device Reset: default-pool surfaces must all be gone or it fails. */
+void vr_device_reset(void)
+{
+    static int logged;
+    release_caps();
+    if (g_hud_rt) { IDirect3DSurface9_Release(g_hud_rt); g_hud_rt = NULL; }
+    g_hud_pending = 0;
+    if (logged++ < 5) hl_log("openvr: device Reset: capture surfaces released");
+}
+
 /* Worker thread: reads counters only, never calls OpenVR. */
 void vr_status(void)
 {
@@ -863,20 +980,7 @@ void vr_status(void)
     if (!g_ready) return;
     hl_log("openvr: %lu poses, %lu eye images submitted, %lu HUD panel updates, %lu errors%s", g_frames, g_submits, g_hud_frames, g_errs,
            g_quit ? " (SteamVR quit)" : "");
-    if (g_prof_frames > 0) {
-        char buf[512];
-        int k, o;
-        double sum = 0, n = (double)g_prof_frames;
-        o = snprintf(buf, sizeof buf, "openvr: timing, ms per frame over %lu frames (%.1f fps):", g_prof_frames, 1000.0 * n / (g_prof[P_FRAME] > 0 ? g_prof[P_FRAME] : 1));
-        for (k = 0; k < P_N && o < (int)sizeof buf - 40; k++) {
-            o += snprintf(buf + o, sizeof buf - o, " %s %.1f", g_prof_names[k], g_prof[k] / n);
-            if (k != P_FRAME) sum += g_prof[k];
-        }
-        snprintf(buf + o, sizeof buf - o, " | other %.1f", (g_prof[P_FRAME] - sum) / n);
-        hl_log("%s", buf);
-        memset(g_prof, 0, sizeof g_prof);
-        g_prof_frames = 0;
-    }
+    vr_prof_report("openvr");
     if (strcmp(st, "idle") != 0 && GetTickCount() - g_step_since > 2000)
         hl_log("openvr: render thread STUCK in %s for %lu ms", st, (unsigned long)(GetTickCount() - g_step_since));
 }

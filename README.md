@@ -80,13 +80,23 @@ The controller's settings (dead zones, look sensitivity, button behaviour) are i
 
 ## Known issues
 
-- **Frame rate:** about 40-45 fps at 1440x1080 on an RTX 3050, with SteamVR filling in the rest. Each frame is
-  copied from the game's Direct3D 9 to SteamVR through the CPU; a direct GPU-to-GPU path is planned.
+- **Frame rate:** about 48-54 fps at 1440x1080 on an RTX 3050, with SteamVR filling in the rest. Each frame is
+  copied from the game's Direct3D 9 to SteamVR through the CPU; a direct GPU-to-GPU path would remove that.
 - **Rotation only:** leaning or moving your head sideways doesn't move the view (use the game's lean keys).
 - **Looking up/down with the mouse or stick tilts the world** in the headset. Leave the body level and look with your head.
 - **HUD text is small.** It is drawn for a monitor; hide the HUD when you don't need it.
 - **The monitor** shows only the HUD over black while you play (the 3D view goes to the headset).
 - Microsoft is ending Windows Mixed Reality support in SteamVR (reportedly November 2026).
+
+## Standalone Quest / Pico (WinlatorXR): test build
+
+A separate zip, `thief2-vr-winlatorxr-VERSION.zip`, runs the game on the headset itself, with no PC, inside
+[WinlatorXR](https://github.com/WinlatorXR/WinlatorXR) (a Windows emulator for Quest and Pico headsets). It gives
+3D with head tracking (including tilt), the Touch controllers, the HUD in both eyes, and menus on WinlatorXR's flat
+screen.
+
+**Not yet run on a real headset.** It is tested only on a PC against a simulated headset. The zip's
+`README_QUEST.txt` has the install steps and what to report. Built with `tools/make_wxr_release.sh`.
 
 ## Also in this repository
 
@@ -106,7 +116,9 @@ xinput_joy/build.sh    # dinput.dll (controller)
 ```
 
 The launchers and the default `headlook.ini` for VR are in `tools/hmd_bridge/vr/`. `tools/make_release.sh [VERSION]`
-builds all three and packages the player zip in `dist/`.
+builds all three and packages the player zip in `dist/`; `tools/make_wxr_release.sh [VERSION]` packages the
+standalone Quest (WinlatorXR) zip, from the files in `tools/quest/`. `tools/wxr_fake.py` stands in for WinlatorXR's
+side when testing on a PC under Wine.
 
 ## Credits
 

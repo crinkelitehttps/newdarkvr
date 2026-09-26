@@ -16,6 +16,24 @@ publish on the TTLG forums (DEVLOG: proxy-DLL instead of exe patch, licence, AV)
 GitHub (`crinkelitehttps/newdarkvr`) on 2026-09-25. The latest build (`vr_gem_always`, the light gem kept
 visible with the HUD toggled off) was built but not yet deployed or tested at that point.
 
+## Update 2026-09-26, night: WinlatorXR (standalone Quest) test release
+
+- **Phase 0 (PC speed-ups):** on the headset, 48-54 fps (was 44-46).
+- **Phase 1 (`stereo=wxr`, `headlook/vr_wxr.c`):** works in Wine against `tools/wxr_fake.py`.
+- **Phase 2 (Touch controllers → `dinput.dll`):** built and packaged.
+- **Release:** `tools/make_wxr_release.sh` makes `dist/thief2-vr-winlatorxr-VERSION.zip` for a Quest 3 owner who
+  agreed to send feedback. The tester guide is `tools/quest/README_QUEST.txt`.
+- **Next:** read the tester's logs (`headlook.log`, `d3d9proxy.log`, `dinput.log`, `Thief2.log`) and answers. Known
+  open points: the per-eye squeeze (140° horizontal) → alternate-eye mode; HUD legibility; the roll sign; the
+  controllers inside a mission (untested). DEVLOG's 2026-09-26 entries have the details.
+
+## Update 2026-09-26: Quest 3 plan; Phase 0 speed-ups deployed, awaiting a headset run
+
+The user wants the game standalone on a **Quest 3** via WinlatorXR, after quick PC speed-ups. The plan and the
+speed-ups (pipelined readback + `Reset` hook, the GPU brightness curve, a pipelined HUD copy; ini `vr_pipeline`,
+`vr_gpu_gamma`) are in DEVLOG's 2026-09-26 entry. Next: the user runs `run_openvr_1440.bat`, and we compare the
+timing line with the baseline in that entry. Then Phase 1 (the `stereo=wxr` backend).
+
 ## The task
 
 Give Thief II (NewDark, Windows exe, D3D9) head-tracked stereo VR by patching/hooking the binary at run time.

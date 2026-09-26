@@ -1,0 +1,30 @@
+; Thief II VR, Quest Touch controllers (read by dinput.dll as an Xbox pad; see README_QUEST.txt).
+; Appended once to user.bnd by run_quest.bat (your old user.bnd is kept as user.bnd.before-quest).
+; Later lines win, so these replace any earlier binds on the same buttons. Rebind any of them in
+; Options > Controls > Customize Controls, using the controllers themselves.
+;   Touch            = Xbox   = game button
+;   right trigger    = RT     = left mouse button (attack / draw bow), sent by dinput.dll
+;   right grip       = RB     = joy5
+;   A / B            = A / B  = joy1 / joy2
+;   X / Y            = X / Y  = joy3 / joy4   (Y shows/hides the HUD; leave it unbound here)
+;   left trigger     = LT     = joy6
+;   left grip        = LB     = held: chord button (grip + another button = joy12..joy26)
+;   stick clicks     = L3/R3  = joy10 / joy11 (both together = recentre the view)
+;   left menu button = Esc (WinlatorXR does this itself)
+joystick_enable 1
+joy_rotate 0
+joystick_deadzone 0.05
+bind joy_axisx +joyxaxis
+bind joy_axisy +joyforward
+bind joy5 +use_item
+bind joy1 +jumpblock
+bind joy2 crouch
+bind joy3 next_weapon
+bind joy6 next_item
+bind joy12 drop_item
+bind joy13 clear_weapon
+bind joy14 prev_weapon
+bind joy17 prev_item
+bind joy23 +leanforward
+bind joy25 +leanleft
+bind joy26 +leanright

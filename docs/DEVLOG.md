@@ -1576,3 +1576,209 @@ it themselves on the host and reading `dinput.log`/`Thief2.log` back over the `/
   VR `headlook.ini`, `xinput_joy.ini`, both launchers, README.md, LICENSE.txt, LICENSE-openvr.txt (text files
   with CRLF), inside one top folder, plus its SHA-256. A test run produced the expected 11 files. The VR ini
   template's comments were rewritten for players (no more hmd_bridge-era wording).
+
+### 2026-09-26 (Quest plan; VR speed-ups built + deployed, NOT yet run on the headset)
+- **Plan agreed** (user: Quest 3, PC quick wins first, no D3D9Ex zero-copy):
+  - Phase 0: the PC speed-ups below.
+  - Phase 1: a `stereo=wxr` backend for **WinlatorXR** (Wine + Box64 + DXVK/Turnip on the Quest). Its XrAPI, per
+    winlatorxr.github.io/xrapi.html:
+    - Head and controller poses arrive as text floats on UDP `localhost:7872`; they end with IPD, FOVX, FOVY and
+      HMD_SYNC, then T/F button states.
+    - The game sends `L_HAPTICS R_HAPTICS MODE_VR MODE_3D FOVX FOVY` to `:7278` (1 1 = VR, side-by-side).
+    - Frames are side-by-side in the back buffer. HMD_SYNC is painted as red in the top-left pixel, and the
+      renderer is held until it changes.
+
+    Tested on the desktop against a fake sender; the HUD is baked into both halves because there's no overlay
+    layer.
+  - Phase 2: the Touch controllers via `xinput_joy`.
+  - Phase 3: on the Quest 3.
+
+  Biggest unknown: whether NewDark runs under WinlatorXR at all. A plain flat-mode smoke test on the Quest should
+  come early.
+- **Baseline** (last run's log, 1440x1080): 44-46 fps.
+
+  | Stage | ms per frame |
+  |---|---|
+  | readback | ~7 |
+  | alpha (curve loop) | 3.5 |
+  | upload | 1.2 |
+  | submit | ~4.8 |
+  | hud | ~2.1 |
+  | other | ~2.3 |
+- **Built:**
+  1. **Pipelined readback** (`vr_pipeline`, default 1, live).
+     - The eye capture targets are now kept across frames.
+     - Frame N is read back and submitted in `vr_begin_frame` of frame N+1, right after `WaitGetPoses`, with the
+       pose it was drawn at (`g_pend_pose`). So the CPU no longer waits for the GPU to finish both passes. Cost:
+       one frame more delay, left to SteamVR's reprojection.
+     - Idle frames send a still-pending frame first, then resend the textures with the pose they hold
+       (`g_tex_pose`).
+     - Since the kept targets are default-pool, a **`Reset` hook** (device slot 16, installed and self-healed next
+       to the Present hook) releases them before the engine's Reset. They're also dropped whenever menus show.
+  2. **Brightness curve on the GPU** (`vr_gpu_gamma`, default 1, live).
+     - Each eye is captured through a ps_2_0 shader instead of `StretchRect`: saturate, `pow(1/gamma)`,
+       black-level mad, alpha 1, into an A8R8G8B8 target. So the CPU per-pixel loop (the 3.5 ms "alpha") is
+       skipped for those eyes.
+     - The shader is assembled at run time with `D3DXAssembleShader` from `d3dx9_43.dll` (which the game
+       imports). It assembled fine with Wine's d3dx9 (176 bytes, throwaway prefix).
+     - Device state is saved and restored with a `D3DSBT_ALL` state block, plus the render target and
+       depth-stencil.
+     - If the scene target isn't a texture, it's `StretchRect`ed into a kept copy texture first.
+     - Any failure logs once and falls back to the old path.
+     - `vr_set_picture` now runs before the eye passes.
+  3. **HUD panel copy pipelined** (same `vr_pipeline` switch): the back buffer is `StretchRect`ed into a kept
+     target at Present and read back at the next Present. That removes the GPU stall that happened every
+     `vr_hud_every`-th frame.
+- Not done: halving the HUD panel's resolution (its text is already hard to read); trimming the per-eye D3D11
+  `Flush`. Revisit if `submit` stays ~5 ms.
+- Deployed to `D:\games\thief_2_vr` (`headlook.dll`; the previous one kept as `headlook.dll.prev`; the user's
+  `headlook.ini` kept, and the new keys default on in code). The template ini documents both keys.
+- **To check in `headlook.log` after the next headset run:**
+  - "brightness curve applied on the GPU", or "curve pass samples a copy of the scene target".
+  - "Reset hook installed", and no "device Reset failed" when going between menu and mission.
+  - The timing line: readback and alpha should be down to ~1-2 ms and ~0.
+  - If anything looks wrong, set `vr_pipeline=0` / `vr_gpu_gamma=0` live to compare.
+- **Evidence on the "does NewDark run there" risk (user, same day; the user can't test the headset or WinlatorXR
+  for now):** the user found YouTube videos of Thief II running at full speed on a Steam Deck and on a **KTR1**.
+  - The Steam Deck is x86 Linux + Proton: it confirms Wine + DXVK, but not ARM emulation.
+  - The KTR1 is an **Android ARM handheld**, and videos exist of Thief (Winlator 2.0 Mr.J builds) on it, e.g.
+    Thief Gold: https://www.youtube.com/watch?v=B0MMLmXkpb8. There is also a TTLG thread, "Winlator Emulator: run
+    Thief on Android phone": https://www.ttlg.com/forums/showthread.php?t=152615.
+
+  Winlator is the base WinlatorXR is forked from (Wine + Box64 + DXVK/Turnip on Android). So the engine running on
+  that stack is **supported by others' reports, not tested by us**. Still unknown: our DLLs (d3d9 stand-in,
+  headlook) under it, and the cost of drawing twice per frame at headset resolution.
+
+### 2026-09-26, later (Phase 1: stereo=wxr, WinlatorXR backend; built, desk-tested in Wine with a fake headset)
+- **Protocol, from WinlatorXR's own source**
+  (github.com/WinlatorXR/WinlatorXR: `app/src/main/java/com/winlator/xr/api/XrAPI.java`, `XrVersion01-05.java`,
+  `XrActivity.java`, `cpp/xr/renderer.c`, `main.c`):
+  - **The game switches the API on**, by writing e.g. `0.5` to `Z:\tmp\xr\version` (= imagefs `/tmp/xr`).
+    WinlatorXR then listens on UDP 7278 for `L_HAP R_HAP MODE_VR MODE_3D FOVX FOVY`, and **only sends poses once
+    MODE_VR > 0**.
+  - **The v0.5 packet to 7872/7873:**
+    - `client0`, then 29 floats: per controller quat, stick, pos; head quat, pos, IPD, FOVX, FOVY, HMD_SYNC.
+    - 19 T/F buttons, in the `ControllerButton` enum order.
+    - 9 floats: altitude, then the grip quats.
+    - The flags `TF`: immersive, SBS.
+  - **HMD_SYNC** steps 0, 12, … 252. The runtime stores the pose sent with each value, and reads pixel (0,0) of the
+    window: red = sync, green must be 0, alpha > 0. It auto-calibrates the colour mapping from the 22 distinct reds
+    it sees. The projection layer then uses that stored pose (roll included), for both eyes.
+  - **FOV:** the layer's FOV is symmetric, taken from what the app sends. With FOV 0 it uses its own (the packet
+    then shows it, ×1.1). Its FOVX/FOVY naming is swapped in the per-frame computation.
+  - **MODE_VR 2** is WinlatorXR's flat screen, which we use for menus.
+- **Built:**
+  - `headlook/vr_wxr.c`/`.h`: UDP listener, parser, mode sender; pose to yaw/pitch/**roll**. Roll is drawn,
+    because the runtime places the picture at the full stored pose.
+  - Frame pacing: wait up to 20 ms for a new sync.
+  - The view scale covers the headset's own FOV, and the resulting FOV is reported back.
+  - Eye capture through the brightness curve.
+  - At Present (in mission): keep a copy of the back buffer (the HUD over black); eyes side by side; the HUD
+    drawn into both halves with a premultiplied-alpha shader, at `vr_hud_dist` with the IPD disparity; the sync
+    pixel via `ColorFill`.
+  - Menus: MODE_VR 2, and no surfaces kept.
+  - Shared GPU helpers moved to `headlook/vr_gpu.c`: shader assembly, a state-safe quad draw, the curve copy.
+  - `stereo=wxr` wired into `headlook.c`, which also wires in the Reset/Present/CreateDevice hooks, the H/Y toggle
+    and the light-gem crop.
+  - New ini keys: `wxr_fov` (0 = the headset's own), `wxr_roll` (1), `wxr_ipd_scale` (1). The eye distance comes
+    from the headset's IPD, converted at 1 unit = 1 foot.
+  - `tools/wxr_fake.py`: WinlatorXR's side, for desktop tests.
+- **Wine test** (ext4 copy, 1280x720, llvmpipe, `STEREO=wxr tools/run-wine.sh` + `tools/wxr_fake.py`; the user
+  clicked into the first mission):
+  - **Handshake:** version file written; MODE 2/0 sent at start; the fake then streamed; ~20k packets, 0
+    unreadable; headset FOV learned (104 × 1.1 = 114.4).
+  - **In mission:** MODE 1/1 and FOV 140.1 × 114.4 sent. The 140 is due to the 16:9 per-eye picture squeezed
+    into half width (see below).
+  - **Frames:** 1659 drawn, 1658 composed, 0 errors. User: "the view is panning left and right. The framerate
+    looks good."
+  - **Sync pixel:** read off the screen (x11grab of the window's top-left 2×2) as red 252 / 144 / 240 / 108, G=B=0.
+    Correct.
+  - **Timing:** 20-26 fps under llvmpipe, with ~30-37 ms of it in Present, i.e. the software GPU. Our own
+    per-frame work: capture 0.1 ms, compose 0.1 ms.
+  - **Not yet seen:** the right-eye half and the HUD in both halves; the i3 tile crops the window to its left
+    half.
+- **Known limitations / next:**
+  - Each eye is drawn at the full back buffer shape and squeezed, which wastes horizontal pixels and FOV.
+    Alternate-eye frames (MODE_3D 2) or a per-eye-shaped target would fix it.
+  - The eye shift is along the level right vector, so it is wrong under roll.
+  - The roll sign in the engine is unverified; `roll_sign` flips it.
+  - The alpha byte of the X window as WinlatorXR reads it is unknown. If it's 0, the framesync is ignored
+    (the picture is still shown, just without matching poses).
+  - Phase 2: the controllers via `wxr_get_input()` → `xinput_joy`.
+- **Full-window screenshot** (the user made the game fullscreen for it; the game was closed straight after at the
+  user's request):
+  - Correct side-by-side eyes with parallax.
+  - **No HUD in either half**, not even the light gem. Expected: a ~96×108 px panel in each half's centre (45°
+    of a 140° eye), but none visible when zoomed.
+  - The log had no errors: both shaders were ready, and "HUD overlays drawn once per frame".
+  - Unknown whether the HUD copy of the back buffer is empty, or the quad draw fails without saying so.
+- **Diagnostic build deployed** to the ext4 copy:
+  - `stereo_dump.now` / Insert also writes `dumpN_wxr_hud_src.bmp` (the HUD copy) and `dumpN_wxr_composed.bmp`
+    (the final frame).
+  - The HUD quad's rectangle is logged.
+  - The HUD copy and quad draw failures, and `CreateStateBlock` failures, are now logged.
+  - Next run: touch `~/games/thief_2/stereo_dump.now` while in a mission, then look at the two BMPs.
+
+### 2026-09-26, evening (Phase 0 result on the headset; a WMR outage that wasn't ours)
+- **Headset showed nothing (tracking fine):**
+  - Our side was healthy: SteamVR was connected, Submit returned 0, and the old DLL behaved the same.
+  - The SteamVR compositor log had "AcquireSync FAILED with WAIT_TIMEOUT" / "driver took the sync texture"
+    warnings, but those also appear on working days.
+  - Suggested isolating it via WMR's Cliff House, then SteamVR Home, and re-plugging the headset; the user said
+    "that worked".
+- **Phase 0 on the headset** (1440x1080, new DLL, `vr_pipeline=1`, `vr_gpu_gamma=1` by default):
+  - **48-54 fps, was 44-46.**
+  - frame 18.6-20.9 ms. alpha **0.0** (was 3.5; the curve shader is used: "brightness curve shader ready").
+    readback **7-8.8, unchanged** (was ~7). upload 1.4. submit 4.0-5.2. hud 2.2-2.6.
+  - The Reset hook fired once ("device Reset: capture surfaces released") with no failure.
+  - So the pipelining didn't remove the readback cost. The NVIDIA D3D9 driver presumably syncs on everything
+    queued, or the copy itself costs that much.
+  - The remaining fix for the PC path is D3D9Ex shared surfaces (zero copy). Deferred: it doesn't help the Quest.
+
+### 2026-09-26, night (Phase 2 controllers + the WinlatorXR test release)
+- **HUD in the wxr mode:** the user saw the HUD in one run (not legible) and decided it isn't blocking for a Quest
+  tester. HUD text was visible in the packaged run below. The diagnostic dump build stays in.
+- **What WinlatorXR does with the controllers itself** (`XrController.java`):
+  - Keyboard mapping, always on: the left menu button → Esc (hard-wired); A/B/X/Y, left grip/trigger and left
+    stick directions → keys set in its controller settings.
+  - Mouse emulation, on by default: right trigger/grip → left/right click, right stick up/down → scroll wheel,
+    right stick left/right → snap turn. **The right hand's position also moves the mouse**, which would turn the
+    body in Thief.
+
+  So our own controller path is needed, with WinlatorXR's disabled.
+- **Built (Phase 2):**
+  - `headlook.dll` exports `headlook_xr_pad(XINPUT_STATE*)` (0 = not wxr, 1 = fresh, 2 = no data yet), via
+    `wxr_xinput()`:
+    - A/B/X/Y as labelled.
+    - Left grip = LB (the chord button), right grip = RB.
+    - Triggers = LT/RT (on/off only), stick clicks = L3/R3.
+    - Sticks come in 0.1 steps. The left menu button is left out.
+  - `vr_pad_buttons()` also reads it, so L3+R3 recentre and Y toggles the HUD.
+  - `xinput_joy`: a `get_state()` wrapper (a real XInput pad first, else `headlook_xr_pad`).
+  - `xr_mode` (from `HEADLOOK_STEREO` / `headlook.ini` `stereo`) reports the joystick present at enumeration,
+    before `headlook.dll` exists.
+  - New ini key `mouselook_pitch` (0 = the right stick only turns).
+  - `tools/wxr_fake.py --input`: stick, trigger and grip demo.
+- **Built (release):**
+  - `tools/quest/`: `thief2vr_quest.bnd` (VR binds: grip = +use_item, A = jump, B = crouch, X/LT = next
+    weapon/item, left-grip chords for drop/put away/previous/lean), `run_quest.bat` and `run_quest_1080.bat`
+    (append the binds once, with a `user.bnd.before-quest` backup and a `thief2vr_binds.done` marker), and
+    `README_QUEST.txt` (tester guide: WinlatorXR APK cats-27, a plain-game check first, container settings,
+    `WINEDLLOVERRIDES=dinput=n,b`, controller settings, controls, what to report, ini quick fixes).
+  - `tools/make_wxr_release.sh` → `dist/thief2-vr-winlatorxr-VERSION.zip`. The Quest `headlook.ini` and
+    `xinput_joy.ini` are derived from the PC templates: `stereo=wxr`, `udp_port=0`, `vr_gamma=1.2`, the `wxr_*`
+    keys, `mouselook_pitch=0`.
+- **Packaged end-to-end test in Wine** (a clean copy `~/games/thief_2_questtest` with the STOCK exe, the zip
+  unpacked, started via `run_quest.bat`, the fake headset; the user clicked into the mission):
+  - The binds were appended and backed up.
+  - The d3d9 stand-in loaded, then `headlook.dll` in wxr mode.
+  - The handshake worked, and so did the mode switch to VR when the mission started.
+  - `dinput.dll` enumerated the joystick 0.5 s before `headlook.dll` loaded, then picked up `headlook_xr_pad`.
+  - User: "The game launched, there is visible hud text. The view was panning left and right."
+  - **Not tested:** the controller demo inside a mission. It was stopped by the user after the fake's trigger
+    clicks kept opening Credits in the main menu. Mouse1 from the trigger works in menus too; a tester's trigger
+    will click the menu too, as intended.
+- Learned: plain Wine needs `dinput=n` for our `dinput.dll` (run-wine.sh sets it), while `d3d9.dll` in the game
+  folder loads without an override. Hence the README step.
+- Habit: `pkill -f "[w]xr_fake.py"` killed its own shell, because the same command line contained
+  `tools/wxr_fake.py` further on. Use a pattern that doesn't occur elsewhere in the command, or a PID.
