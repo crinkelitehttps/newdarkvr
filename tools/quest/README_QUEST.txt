@@ -9,8 +9,9 @@ you can do is go through the steps below in order and tell us exactly where thin
 You need
 --------
 * A Quest 3 or 3S (a Quest 2 should also work, but slower).
-* Thief II: The Metal Age with NewDark, as sold on Steam or GOG. The mod is written for one exact build of
-  Thief2.exe (SHA-256 af56a109...). A different build still runs, just without VR, and headlook.log says so.
+* Thief II: The Metal Age with NewDark, as sold on Steam or GOG. The mod knows two exact builds of
+  Thief2.exe: NewDark 1.28 (SHA-256 af56a109...) and 1.29 (d26342c3...). A different build still runs, just
+  without VR, and headlook.log says so.
 * A PC to copy files, and the headset in developer mode (needed to install apps from outside the store).
 
 This zip contains no game files and no emulator: only the mod (three DLLs, settings and launchers).

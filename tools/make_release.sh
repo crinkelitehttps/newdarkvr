@@ -30,6 +30,7 @@ text = {                                             # zip path -> source (Windo
     "xinput_joy.ini": "xinput_joy/xinput_joy.ini",
     "run_openvr_1440.bat": "tools/hmd_bridge/vr/run_openvr_1440.bat",
     "run_openvr.bat": "tools/hmd_bridge/vr/run_openvr.bat",
+    "run_openvr_hwtl.bat": "tools/hmd_bridge/vr/run_openvr_hwtl.bat",
     "README.md": "README.md",
     "LICENSE.txt": "LICENSE",
     "LICENSE-openvr.txt": "tools/hmd_bridge/LICENSE.openvr",

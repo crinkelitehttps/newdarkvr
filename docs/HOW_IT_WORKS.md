@@ -2,8 +2,10 @@
 
 A technical overview for modders. The day-by-day evidence behind each point is in [DEVLOG.md](DEVLOG.md).
 
-All addresses are for the NewDark `Thief2.exe` with SHA-256 `af56a109…fba684`, at its preferred image base
-0x400000. The DLLs rebase them at run time, and check the bytes at every patch site before touching anything.
+All addresses are for the NewDark 1.28 `Thief2.exe` with SHA-256 `af56a109…fba684`, at its preferred image base
+0x400000. `headlook.c` has a table with the same addresses for 1.29 (`d26342c3…`; a recompile, but the scene
+function is instruction-for-instruction the same), picks the build whose hook site holds the expected bytes,
+rebases at run time (1.29 is relocatable), and checks the bytes at every patch site before touching anything.
 
 ## 1. Getting loaded without touching the exe
 

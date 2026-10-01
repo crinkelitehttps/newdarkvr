@@ -60,23 +60,64 @@
 #include "vr_openvr.h"
 #include "vr_wxr.h"
 
-/* Link-time addresses in Thief2.exe (image base 0x400000, sha256 af56a109...); rebased at run time. */
+/* Link-time addresses in Thief2.exe (image base 0x400000), per NewDark build; rebased at run time (1.29 is
+ * relocatable and may load elsewhere). install_hook() picks the build whose hook site holds the expected bytes.
+ * The 1.29 values were mapped from 1.28 by the scene function being instruction-for-instruction identical
+ * (see docs/DEVLOG.md, 2026-09-29). Field comments describe 1.28's names. */
+typedef struct {
+    const char *name;
+    int hwtl;             /* 0: classic renderer, hook_site is `mov [esp+0x28], cx` (hl_stub).
+                             1: Thief2_hwtl.exe, hook_site is `mov [poseptr], eax` right after the local pose copy
+                             in its scene function, with eax = that pose (hl_stub_hw)                         */
+    unsigned poseptr;     /* hwtl only: the global the hooked instruction stores the pose pointer to        */
+    unsigned hook_site;   /* mov [esp+0x28], cx   (local heading store in FUN_005cee30) */
+    unsigned camptr;      /* global holding a pointer to the camera struct (mode at +0)  */
+    unsigned scene_fn;    /* FUN_005cee30: per-frame scene render                        */
+    unsigned wrap_site;   /* `call scene_fn` in the frame handler's hardware branch      */
+    unsigned d3ddev_ptr;  /* global holding the IDirect3DDevice9 pointer                 */
+    unsigned viewmat;     /* view matrix (9 floats) built from the local angles          */
+    unsigned viewscale;   /* float 1/tan(half FOV at 4:3), default 1.0 (90 deg); set once by FUN_005cc900,
+                             read every frame in FUN_005cee30 (times the camera's zoom at +4)   */
+    unsigned ovl_call;    /* `call FUN_0058c080` in FUN_005cee30: draws the queued 2D/HUD overlays, then empties
+                             the queue (so only the first scene call of a frame draws them) */
+    unsigned ovl_fn;
+    unsigned provider;    /* the D3D display provider object; its vtable [0](arg) / [1]() bracket the scene */
+    unsigned prov_arg;    /* the argument FUN_005cee30 passes to provider vtable[0] */
+    unsigned horplus;     /* int: 1 = widescreen mode widens the view sideways (Hor+), set in FUN_00689aa0
+                             unless widescreen_lock_hfov is set. 0 = no such flag, always Hor+ (hwtl)   */
+} exe_addrs_t;
+
+static const exe_addrs_t g_builds[] = {
+    { "NewDark 1.28 (sha256 af56a109...)", 0, 0, 0x5CEF38u, 0xA2A988u, 0x5CEE30u, 0x5CF2E2u, 0xA36040u, 0x92D8F4u,
+      0x7E62D8u, 0x5CF06Fu, 0x58C080u, 0xA36014u, 0xA33F44u, 0x7DF800u },
+    { "NewDark 1.29 (Thief 2 d26342c3... / Thief Gold 1a4bec9e...)", 0, 0, 0x5D1388u, 0xAA141Cu, 0x5D1280u, 0x5D1732u, 0xAACAD4u, 0x9A4374u,
+      0x85C018u, 0x5D14BFu, 0x58D3E0u, 0xAACAA8u, 0xAAA9D8u, 0x855540u },
+    /* Thief Gold's 1.29 Thief.exe and Thief_hwtl.exe share every address and hook-site byte with Thief 2's (the scene
+     * functions are instruction-for-instruction identical, all globals have the same reference counts), so these
+     * two entries serve both games (DEVLOG 2026-10-01). */
+    /* Thief2_hwtl.exe 1.29 hwtl1 (sha256 4f1f98ed...): a different compile (SSE2), mapped by hand (DEVLOG 2026-09-29).
+     * Its scene function FUN_005a0a80 copies the camera pose to a local and renders every pass from it (a pre-pass,
+     * environment cube faces, the main view); the view scale multiplies the camera zoom for the main pass only, and
+     * the projection is Hor+ with half-height 0.75/scale like the classic one. The HUD overlay flush is inlined in
+     * the scene function (no call to redirect), and there is no provider bracket: ovl_* and provider are 0. */
+    { "NewDark 1.29 hwtl (Thief 2 4f1f98ed... / Thief Gold e34cb1e6...)", 1, 0x9B11A0u, 0x5A0BE7u, 0x8E3F50u, 0x5A0A80u, 0x5A2297u, 0x8E5224u,
+      0x9B17D8u, 0x8796BCu, 0, 0, 0, 0, 0 },
+};
+static const exe_addrs_t *A = &g_builds[0];      /* set by install_hook() */
+
 #define LINK_BASE      0x400000u
-#define HOOK_SITE_VA   0x5CEF38u   /* mov [esp+0x28], cx   (local heading store in FUN_005cee30) */
-#define CAMPTR_VA      0xA2A988u   /* global holding a pointer to the camera struct (mode at +0)  */
-#define SCENE_FN_VA    0x5CEE30u   /* FUN_005cee30: per-frame scene render                        */
-#define WRAP_SITE_VA   0x5CF2E2u   /* `call 0x5CEE30` in the frame handler's hardware branch      */
-#define D3DDEV_PTR_VA  0xA36040u   /* global holding the IDirect3DDevice9 pointer                 */
-#define VIEWMAT_VA     0x92D8F4u   /* view matrix (9 floats) built from the local angles          */
-#define VIEWSCALE_VA   0x7E62D8u   /* float 1/tan(half FOV at 4:3), default 1.0 (90 deg); set once by FUN_005cc900,
-                                      read every frame in FUN_005cee30 (times the camera's zoom at +4)   */
-#define OVL_CALL_VA    0x5CF06Fu   /* `call FUN_0058c080` in FUN_005cee30: draws the queued 2D/HUD overlays, then empties
-                                      the queue (so only the first scene call of a frame draws them) */
-#define OVL_FN_VA      0x58C080u
-#define PROVIDER_VA    0xA36014u   /* the D3D display provider object; its vtable [0](arg) / [1]() bracket the scene */
-#define PROV_ARG_VA    0xA33F44u   /* the argument FUN_005cee30 passes to provider vtable[0] */
-#define HORPLUS_VA     0x7DF800u   /* int: 1 = widescreen mode widens the view sideways (Hor+), set in FUN_00689aa0
-                                      unless widescreen_lock_hfov is set                                */
+#define HOOK_SITE_VA   (A->hook_site)
+#define CAMPTR_VA      (A->camptr)
+#define SCENE_FN_VA    (A->scene_fn)
+#define WRAP_SITE_VA   (A->wrap_site)
+#define D3DDEV_PTR_VA  (A->d3ddev_ptr)
+#define VIEWMAT_VA     (A->viewmat)
+#define VIEWSCALE_VA   (A->viewscale)
+#define OVL_CALL_VA    (A->ovl_call)
+#define OVL_FN_VA      (A->ovl_fn)
+#define PROVIDER_VA    (A->provider)
+#define PROV_ARG_VA    (A->prov_arg)
+#define HORPLUS_VA     (A->horplus)
 
 /* Read by hl_stub (asm below). Aligned 32-bit stores/loads are atomic on x86. */
 volatile unsigned g_yaw = 0, g_pitch = 0, g_roll = 0;
@@ -123,6 +164,53 @@ __asm__(
     "fld dword ptr [esp+0x28]\n"
     "fadd dword ptr [_g_eye_dy]\n"
     "fstp dword ptr [esp+0x28]\n"
+    "9:\n"
+    "pop edx\n"
+    "pop eax\n"
+    "popfd\n"
+    "ret\n"
+    ".att_syntax prefix\n");
+
+/* Thief2_hwtl.exe: entered by `call` from the patched `mov [poseptr], eax`, just after the scene function has
+ * copied the camera pose to a local, so eax points at it: floats x, y, z at [eax], [eax+4], [eax+8]; words bank,
+ * pitch, heading at [eax+0x10], [eax+0x12], [eax+0x14] (the same layout as hl_stub's). Does the original store,
+ * then the same adjustments as hl_stub. Preserves all registers and flags. */
+unsigned g_hw_poseptr_addr = 0;
+extern void hl_stub_hw(void);
+__asm__(
+    ".text\n"
+    ".globl _hl_stub_hw\n"
+    "_hl_stub_hw:\n"
+    ".intel_syntax noprefix\n"
+    "pushfd\n"
+    "push eax\n"
+    "push edx\n"
+    "mov edx, eax\n"                          /* the local pose */
+    "mov eax, dword ptr [_g_hw_poseptr_addr]\n"
+    "mov dword ptr [eax], edx\n"             /* the original instruction */
+    "mov eax, dword ptr [_g_camptr_addr]\n"
+    "mov eax, dword ptr [eax]\n"
+    "test eax, eax\n"
+    "jz 9f\n"
+    "cmp dword ptr [eax], 0\n"               /* camera mode: only when it is on the player */
+    "jne 9f\n"
+    "cmp dword ptr [_g_enabled], 0\n"
+    "je 5f\n"
+    "mov eax, dword ptr [_g_yaw]\n"
+    "add word ptr [edx+0x14], ax\n"          /* heading */
+    "mov eax, dword ptr [_g_pitch]\n"
+    "add word ptr [edx+0x12], ax\n"          /* pitch */
+    "mov eax, dword ptr [_g_roll]\n"
+    "add word ptr [edx+0x10], ax\n"          /* bank (roll) */
+    "5:\n"
+    "cmp dword ptr [_g_eye_active], 0\n"
+    "je 9f\n"
+    "fld dword ptr [edx]\n"
+    "fadd dword ptr [_g_eye_dx]\n"
+    "fstp dword ptr [edx]\n"
+    "fld dword ptr [edx+4]\n"
+    "fadd dword ptr [_g_eye_dy]\n"
+    "fstp dword ptr [edx+4]\n"
     "9:\n"
     "pop edx\n"
     "pop eax\n"
@@ -272,20 +360,40 @@ static void load_config(void)
 
 /* ------------------------------------------------------------------ hook installation */
 
+/* Does this build's hook site hold what we expect? Classic: `mov [esp+0x24], eax; mov [esp+0x28], cx`. hwtl:
+ * `movq [esp+0x90], xmm0; mov [poseptr], eax` (the absolute address as relocated by the loader). */
+static int build_matches(const exe_addrs_t *b, unsigned char *base)
+{
+    static const unsigned char classic[9] = { 0x89, 0x44, 0x24, 0x24, 0x66, 0x89, 0x4C, 0x24, 0x28 };
+    static const unsigned char hwtl[9] = { 0x66, 0x0F, 0xD6, 0x84, 0x24, 0x90, 0x00, 0x00, 0x00 };
+    unsigned char *site = base + (b->hook_site - LINK_BASE);
+    unsigned abs;
+    if (!b->hwtl) return memcmp(site - 4, classic, sizeof classic) == 0;
+    memcpy(&abs, site + 1, 4);
+    return memcmp(site - 9, hwtl, sizeof hwtl) == 0 && site[0] == 0xA3 &&
+           abs == (unsigned)(base + (b->poseptr - LINK_BASE));
+}
+
 static int install_hook(void)
 {
-    static const unsigned char expect[9] = { 0x89, 0x44, 0x24, 0x24, 0x66, 0x89, 0x4C, 0x24, 0x28 };
     unsigned char *base = (unsigned char *)GetModuleHandleA(NULL);
     unsigned char *site = base + (HOOK_SITE_VA - LINK_BASE);
     DWORD old;
     int rel;
+    size_t i;
 
-    if (memcmp(site - 4, expect, sizeof expect) != 0) {
-        hl_log("hook NOT installed: unexpected bytes at site %p (different Thief2.exe build?)", (void *)site);
+    for (i = 0; i < sizeof g_builds / sizeof g_builds[0]; i++)
+        if (build_matches(&g_builds[i], base)) break;
+    if (i == sizeof g_builds / sizeof g_builds[0]) {
+        hl_log("hook NOT installed: no known Thief2.exe build matched (exe base %p; supported: 1.28, 1.29, 1.29 hwtl)", (void *)base);
         return 0;
     }
+    A = &g_builds[i];
+    site = base + (HOOK_SITE_VA - LINK_BASE);
+    hl_log("Thief2.exe build: %s", A->name);
     g_camptr_addr = (unsigned)(base + (CAMPTR_VA - LINK_BASE));
-    rel = (int)((unsigned char *)hl_stub - (site + 5));
+    if (A->hwtl) g_hw_poseptr_addr = (unsigned)(base + (A->poseptr - LINK_BASE));
+    rel = (int)((unsigned char *)(A->hwtl ? hl_stub_hw : hl_stub) - (site + 5));
     if (!VirtualProtect(site, 5, PAGE_EXECUTE_READWRITE, &old)) {
         hl_log("hook NOT installed: VirtualProtect failed (%lu)", GetLastError());
         return 0;
@@ -912,6 +1020,10 @@ static int install_overlay_hook(void)
     unsigned char *fn = base + (OVL_FN_VA - LINK_BASE);
     DWORD old;
     int cur, rel;
+    if (!A->ovl_call) {
+        hl_log("openvr: HUD overlay hook not available for this build (HUD overlays stay in the first eye's picture)");
+        return 0;
+    }
     memcpy(&cur, site + 1, 4);
     if (site[0] != 0xE8 || site + 5 + cur != fn) {
         hl_log("openvr: HUD overlay hook NOT installed: unexpected code at %p", (void *)site);
@@ -1019,7 +1131,10 @@ static int install_stereo(void)
     g_dev_slot = (IDirect3DDevice9 **)(base + (D3DDEV_PTR_VA - LINK_BASE));
     g_viewmat = (const float *)(base + (VIEWMAT_VA - LINK_BASE));
     g_viewscale = (float *)(base + (VIEWSCALE_VA - LINK_BASE));
-    g_horplus = (const int *)(base + (HORPLUS_VA - LINK_BASE));
+    {
+        static const int always_horplus = 1;
+        g_horplus = A->horplus ? (const int *)(base + (HORPLUS_VA - LINK_BASE)) : &always_horplus;
+    }
     rel = (int)((unsigned char *)hl_scene - (site + 5));
     if (!VirtualProtect(site, 5, PAGE_EXECUTE_READWRITE, &old)) {
         hl_log("scene-call wrapper NOT installed: VirtualProtect failed (%lu)", GetLastError());

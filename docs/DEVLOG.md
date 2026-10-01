@@ -1782,3 +1782,174 @@ it themselves on the host and reading `dinput.log`/`Thief2.log` back over the `/
   folder loads without an override. Hence the README step.
 - Habit: `pkill -f "[w]xr_fake.py"` killed its own shell, because the same command line contained
   `tools/wxr_fake.py` further on. Use a pattern that doesn't occur elsewhere in the command, or a PID.
+
+### 2026-09-27 (phone smoke-test kit; built + tested in Wine, not yet on the phone)
+- **The user's phone:** a Motorola with a MediaTek Helio G81 Ultra (Mali-G52 MC2, 4-8 GB). There's no Turnip on
+  Mali, and the GPU is far below the Quest 3's XR2 Gen 2. So it's a **smoke test (does it run under
+  Winlator/Box64 on ARM?), not a Quest performance predictor**. WinlatorXR itself needs a headset's OpenXR runtime,
+  so the phone uses plain Winlator.
+- **Built:**
+  - `tools/quest/wxr_fake.c` → `wxr_fake.exe`, a Windows twin of `tools/wxr_fake.py`:
+    - it listens on 7278, and once MODE_VR > 0 sends v0.5 packets at 72 Hz to 7872/7873;
+    - the head sways ±30° yaw and ±10° pitch;
+    - it echoes the FOV;
+    - it exits 15 s after the game goes quiet;
+    - it logs to `wxr_fake.log`.
+  - `run_phone_vr_test.bat` (sets `HEADLOOK_STEREO=wxr`, starts the fake, starts the game at 1280x720).
+  - `run_phone_flat.bat` (`HEADLOOK_STEREO=off`, a baseline).
+  - `PHONE_TEST.txt`: Winlator APK, copying to Download (= D:), container settings (Vortek+DXVK, else
+    VirGL+WineD3D; `WINEDLLOVERRIDES=dinput=n,b`), the two runs, the logs.
+  - `tools/make_phone_test.sh` → `dist/thief2-vr-phone-test-VERSION.zip`, reusing the WinlatorXR zip's DLLs and
+    inis.
+- **Wine test** of the phone kit in `~/games/thief_2_questtest`, at the main menu only, no input:
+  - The `.bat` started `wxr_fake.exe`, which heard the game's mode after 0.6 s and sent exactly 72 packets/s.
+  - `headlook.log`: 2531 packets, 0 unreadable.
+- The zip `thief2-vr-phone-test-v0.2-phone-test1.zip` was copied to `D:\`. Not committed yet.
+
+### 2026-09-29 (NewDark 1.29: addresses re-mapped; built + deployed, NOT yet run)
+- **The user installed NewDark 1.29** over `D:\games\thief_2_vr`. There are three exes, all ProductVersion 1.29:
+  - `Thief2.exe`, 5509120 bytes, sha256 `d26342c3…8aafe8f`;
+  - `Thief2_hwtl.exe`, a separate hardware T&L renderer with `main.fxo` shaders; **deferred by the user**;
+  - `Thief2MP.exe`.
+  1.29 is a full recompile, and it now has a `.reloc` section. It loaded at a non-default base (the hook site
+  was at `0x29EF38`).
+- **First 1.29 run (23:19):**
+  - The d3d9 stand-in loaded `headlook.dll` fine.
+  - `hook NOT installed: unexpected bytes at site` → idle, so the game ran flat. The byte checks did their job.
+  - `dinput.dll` (controllers) worked unchanged; it uses no engine addresses.
+- **Re-mapping, with objdump only:**
+  - The 9-byte hook-site pattern is unique in 1.29.
+  - It sits in a scene function (`0x5D1280`) that is **instruction-for-instruction identical** to 1.28's
+    `FUN_005cee30`. Pairing the operands line by line gave every address in it.
+  - The wrapper site is the `call 0x5d1280` behind `test [..],0x8000` in the frame handler. The other call
+    (`0x5D1785`) is the software branch, as in 1.28.
+  - Hor+ came from the same code shape as 1.28's `FUN_00689aa0` (at `0x68c5xx`).
+  - Check: each 1.29 global has exactly as many references as its 1.28 counterpart (camera pointer 75, device
+    539, provider 34, …). The FOV float defaults to 1.0 in both.
+
+  | what | 1.28 | 1.29 |
+  |---|---|---|
+  | hook site | 5CEF38 | 5D1388 |
+  | camera pointer | A2A988 | AA141C |
+  | scene function | 5CEE30 | 5D1280 |
+  | wrapper site | 5CF2E2 | 5D1732 |
+  | device pointer | A36040 | AACAD4 |
+  | view matrix | 92D8F4 | 9A4374 |
+  | view scale | 7E62D8 | 85C018 |
+  | overlay call | 5CF06F | 5D14BF |
+  | overlay function | 58C080 | 58D3E0 |
+  | provider | A36014 | AACAA8 |
+  | provider argument | A33F44 | AAA9D8 |
+  | Hor+ flag | 7DF800 | 855540 |
+
+- **Code changes:**
+  - `headlook.c`: the `#define`s became a per-build table (`g_builds[]`). `install_hook()` picks the build whose
+    hook site holds the expected bytes and logs `Thief2.exe build: …`. The other sites keep their own checks.
+  - `install_vr_copy.sh` accepts 1.29 (from `bin/Thief2.129.exe`).
+  - README, HOW_IT_WORKS and the Quest guide now list both builds.
+- **State: user-tested on the headset, "looks good".** `headlook.log` (23:33) shows `Thief2.exe build: NewDark
+  1.29`, and all three hooks were installed: the exe was at base `0x00CF0000` (relocated), the hook at `00EC1388`.
+  31940 eye images were submitted with 0 errors.
+  - **Frame rate is lower than the Phase 0 result:** 33-38 fps (was 48-54).
+  - Timings: submit 10-12 ms (was 4-5), readback 9-11 ms (was 7-8.8). drawL/drawR are 0.2-1.6 ms, so it isn't
+    the engine's rendering.
+  - Not investigated. It may be SteamVR/WMR state that day rather than 1.29.
+- A Ghidra project for 1.29 (`ghidra-proj/Thief2_129`) was imported for later use; it wasn't needed for this.
+- **`Thief2_hwtl.exe` shadows (user: "no NPC/player shadows in flat mode"):**
+  - Its log (23:11) shows HWTL initialised fine: SM 3.0 ok, `main.fxo`/`postprocess.fxo` loaded, and `mods/hwtl`
+    first in `mod_path`.
+  - Per `doc/hwtl_variant.txt`:
+    - `shadow_enable` defaults to 1, but **only dynamic lights and AnimLights are HWTL lights** (so only they
+      cast shadows). Stock OMs are mostly baked lightmaps, so NPC shadows appear only near such lights, unless
+      a mission is relit.
+    - **`player_shadow` defaults to 0.**
+    - Related: `ai_aware_of_shadow`, `hwtl_quality`/`hwtl_lights`, `sm_size`.
+  - Nothing set in the user's configs yet. VR on the hwtl exe is still deferred.
+
+### 2026-09-29, later (Thief2_hwtl.exe: first VR attempt; built + deployed, NOT yet run)
+- **1.28 → 1.29 test:** see the entry above ("looks good").
+- **hwtl is a different compile:** SSE2 throughout, so nothing matches the classic exe by bytes or instruction
+  shape. It was mapped by hand, with objdump and a Ghidra project `ghidra-proj/Thief2_hwtl`
+  (`bin/Thief2_hwtl.129.exe`, sha256 `4f1f98ed…`).
+- **Camera pointer `0x8E3F50`:** found by matching 12-instruction windows around the classic references
+  (`mapglobal.py` in the session scratchpad; 74 refs vs 75).
+- **The hwtl view:** built by `FUN_0062dee0` from a pose block `0xD45F40`, via `D3DXMatrixLookAtLH` → the effect
+  parameter `view_mx`, and `D3DXMatrixPerspectiveOffCenterRH` → `proj_mx`.
+  - The pose block is filled by `FUN_0055e810(pose)`. That is called from `FUN_0059ffa0` (one render pass), which
+    is called 4× from the scene function **`FUN_005a0a80`**.
+- **Scene function `FUN_005a0a80`:**
+  - Its prologue matches the classic one: the camera pointer, mode 3/4 → a fixed zoom.
+  - It copies the camera pose to a local `[esp+0x90]`:
+    - x, y, z;
+    - the cell id, which is `0xffff`;
+    - bank|pitch at `+0x10`, heading at `+0x14`.
+  - It builds the 9-float view matrix `0x9B17D8` (`FUN_0068e570`) and stores the pose pointer to `0x9B11A0`.
+  - Then it renders every pass from that local:
+    - a pre-pass (`0x8E5CF4`);
+    - 2×6 cube faces for environment maps (view scale fixed at 1.0);
+    - the main view (`0x8E5CE4`), with `zoom × [0x8796BC]`.
+  - The overlay-queue flush (classic `FUN_0058c080`) is **inlined** at the end, and there is no provider bracket.
+- **Frame handler `FUN_005a21e0` (message 0x40):** one call, at `0x5A2297` (no software branch).
+- **Device:** `0x8E5224` (`Clear` via vtable `+0xAC` in the scene function).
+- **Projection:** `FUN_0062dd80` uses half-height = near × 3.0 × 0.25 / scale and width = aspect × height. So
+  it's the classic Hor+ convention (tan 0.75 at scale 1), and hwtl has no `widescreen_lock_hfov`.
+- **Code:**
+  - A table entry with `hwtl=1`.
+  - Hook at `0x5A0BE7`: `mov [0x9B11A0], eax`, 5 bytes, eax = &pose. The new asm `hl_stub_hw` does the original
+    store through the relocated address, then the same yaw/pitch/roll and eye-shift adjustments on `[eax+…]`.
+  - `build_matches()` checks, for hwtl:
+    - the `movq [esp+0x90],xmm0` before the site;
+    - `A3` + the relocated `0x9B11A0`.
+  - Hor+ is a constant 1.
+  - The overlay hook is skipped with a log line.
+  - Offline check: each of the three exes matches exactly one entry, and each wrapper site calls its own scene
+    function.
+- **Launcher:** new `run_openvr_hwtl.bat` (`Thief2_hwtl.exe`, 1440x1080, no MSAA), installed by
+  `install_vr_copy.sh`.
+- **Expected gaps:**
+  - The HUD overlays (gem, item models) draw in the first eye's pass only; the overlay flush is inlined, so it
+    needs another hook.
+  - The environment and pre-passes run twice per frame (a GPU cost).
+  - Unknown: whether `GetRenderTarget(0)` after the scene call holds the finished (post-processed) picture.
+    `stereo_dump.now` / Insert would show it.
+
+### 2026-09-30 / 10-01 (hwtl result; Thief Gold support)
+- **hwtl on the headset: user "works lovely".**
+  - `headlook.log` (00:03): build `NewDark 1.29 hwtl`, hook at `005A0BE7` (base 0x400000), wrapper at `005A2297`.
+  - 0 errors. The eye axis matches the heading, e.g. 208.5° → (-0.477, 0.879), so the view matrix `0x9B17D8` is right.
+  - 22-31 fps. Readback is 14-18 ms, the bottleneck, with `vr_gpu_convert=1` and the curve shader ready.
+- **Thief Gold request (`D:\games\thief_gold_vr`):**
+  - The folder had the original LGS 1.37 `THIEF.EXE` (2.2 MB, with ddfix) plus TFix files, so it had no NewDark.
+  - The stale `thief.log` is from a Steam 1.27 install.
+  - The user installed NewDark 1.29 with **RoguePatcher 1.29.0** (github JarrodDoyle/rogue-patcher, the HWTL
+    component included), run on the Windows host. Executables from WSL go to Wine, so it couldn't be launched from
+    here.
+  - Result: `Thief.exe` (`1a4bec9e…`), `Thief_hwtl.exe` (`e34cb1e6…`), `ThiefMP.exe`, all ProductVersion 1.29.
+    Copies are in `bin/ThiefGold*.129.exe`.
+- **Mapping result: nothing to map.** Gold's 1.29 exes match Thief 2's at every address we use:
+  - The classic scene function `0x5D1280` is identical over all 329 instructions, and the hwtl one `0x5A0A80` over
+    1150 (`alignmap.py` in the scratchpad).
+  - The hook sites are at the same file offsets, and the wrapper sites are the same (`0x5D1732`, `0x5A2297`).
+  - Every global has the same reference count (75/539/1/2/34/4/5 classic; 74/347/1/4/5 hwtl).
+  - So the two 1.29 table entries serve both games; only their labels changed.
+- **`install_vr_copy.sh`:**
+  - It detects `Thief2.exe` vs `Thief.exe`.
+  - It rewrites the launchers' exe names (`bat()`).
+  - It checks exe hashes against a list of all six known builds.
+  - Use: `tools/hmd_bridge/install_vr_copy.sh /mnt/d/games/thief_gold_vr`. The controller DLL goes in via
+    `xinput_joy/install_joy_copy.sh /mnt/d/games/thief_gold_vr`.
+  - Both were deployed with template inis. Nothing has been run in Gold yet.
+- **Gold-specific risks, untested:**
+  - The camera struct and units are assumed to be the same as Thief 2's (same engine).
+  - Gold's leftover `ddfix.dll` isn't loaded by NewDark.
+- **Gold headset test: user "Tested Gold in the headset"** (2026-10-01). The surviving `headlook.log` is from a
+  later flat run: `Thief.exe` without arguments, `stereo=0`, build recognised, hook installed. Each run overwrites
+  the log, so the headset run itself left no log here.
+- **Release v0.3** (Thief II + Thief Gold, NewDark 1.28/1.29, hwtl experimental):
+  - The `run_openvr*.bat` launchers now pick `Thief2.exe` or `Thief.exe` themselves (`set GAME=…`), so one zip
+    serves both games. `install_vr_copy.sh` renames the exe only in the old `run_vr.bat`; its first version also
+    rewrote the detection line, a bug caught before release.
+  - `make_release.sh` ships `run_openvr_hwtl.bat`.
+  - README: the supported-builds table, Gold/RoguePatcher, the hwtl launcher and its known issue, updated fps.
+  - Not committed (unrelated or not ours): the phone-test kit files and their `.gitignore` line, `key`,
+    `RoguePatcher_1.29.0.exe`.

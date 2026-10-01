@@ -1,6 +1,6 @@
 # Thief II VR (NewDark)
 
-Play **Thief II: The Metal Age** in a SteamVR headset. The game is drawn separately for each eye and follows your
+Play **Thief II: The Metal Age** or **Thief Gold** in a SteamVR headset. The game is drawn separately for each eye and follows your
 head, the HUD and menus float on a panel in front of you, and an Xbox-style controller works throughout. Nothing in
 the game install is modified: the mod is a few files dropped into the game folder.
 
@@ -21,22 +21,32 @@ the game install is modified: the mod is a few files dropped into the game folde
 ## Requirements
 
 - Windows 10 or 11 and **SteamVR** with a working headset.
-- **Thief II with NewDark**, as sold on Steam/GOG. The mod is written for one exact build of `Thief2.exe`
-  (SHA-256 `af56a109a51ac9100a15da72cd403170a266736313679029fae1c222ebfba684`). With a different build it
-  refuses to hook the game and says so in `headlook.log`, rather than crash.
+- **Thief II or Thief Gold with NewDark.** The mod knows these exact builds, and with any other it refuses to hook
+  the game and says so in `headlook.log`, rather than crash:
+
+  | Game | Exe | NewDark | SHA-256 |
+  |---|---|---|---|
+  | Thief II | `Thief2.exe` | 1.28 | `af56a109a51ac9100a15da72cd403170a266736313679029fae1c222ebfba684` |
+  | Thief II | `Thief2.exe` | 1.29 | `d26342c34624a08a0e5fc8d8c9daf14c676642c328f41c01f548170774aafe8f` |
+  | Thief II | `Thief2_hwtl.exe` | 1.29 (hardware T&L) | `4f1f98ed9cde1a2b1d8e2c6780ad4aebe74c0ea036efe0653b6fbae16bbc9f15` |
+  | Thief Gold | `Thief.exe` | 1.29 | `1a4bec9ef2d30ae948154bf74d31808d5942bbbcd9cbd6d40a0296622b44b5bb` |
+  | Thief Gold | `Thief_hwtl.exe` | 1.29 (hardware T&L) | `e34cb1e64a15d51695710e2550b4b2f847e11867c2c6fcff697f6d324ba24222` |
+
+  Thief Gold needs NewDark 1.29 installed first, for example with
+  [RoguePatcher](https://github.com/JarrodDoyle/rogue-patcher) (tick its HWTL component for the `_hwtl` exe).
 - A reasonably modern graphics card. Every frame is copied through the CPU on its way to SteamVR (see Known issues).
 
 ## Install
 
-Download the release zip, and copy everything inside its `thief2-vr-…` folder into the Thief II folder (where
-`Thief2.exe` is):
+Download the release zip, and copy everything inside its `thief2-vr-…` folder into the game folder (where
+`Thief2.exe` or, for Thief Gold, `Thief.exe` is). The launchers work out which game is there:
 
 | File | What it is |
 |---|---|
 | `d3d9.dll` | Loads the mod when the game starts Direct3D; passes everything else to Windows' own `d3d9.dll` |
 | `headlook.dll`, `headlook.ini` | The VR mod and its settings |
 | `openvr32\openvr_api.dll` | Valve's OpenVR library (32-bit), in an `openvr32` subfolder |
-| `run_openvr_1440.bat`, `run_openvr.bat` | Launchers |
+| `run_openvr_1440.bat`, `run_openvr.bat`, `run_openvr_hwtl.bat` | Launchers |
 | `dinput.dll`, `xinput_joy.ini` | Optional: controller support |
 
 If you already use another `d3d9.dll` (ReShade, for example), rename that one to `d3d9_chain.dll` first; the mod's
@@ -48,6 +58,9 @@ If you already use another `d3d9.dll` (ReShade, for example), rename that one to
 
 1. Start SteamVR with the headset on.
 2. Run **`run_openvr_1440.bat`** (1440x1080; the smoother choice), or `run_openvr.bat` (1920x1440: sharper, slower).
+   With NewDark 1.29's hardware T&L renderer installed, **`run_openvr_hwtl.bat`** plays that instead (dynamic
+   shadows and the other new effects; experimental, slower, and the light gem and held-item models show in one eye
+   only for now).
 3. Load a mission, then recentre (below) while looking straight ahead.
 
 | Action | Keyboard | Controller |
@@ -80,8 +93,10 @@ The controller's settings (dead zones, look sensitivity, button behaviour) are i
 
 ## Known issues
 
-- **Frame rate:** about 48-54 fps at 1440x1080 on an RTX 3050, with SteamVR filling in the rest. Each frame is
-  copied from the game's Direct3D 9 to SteamVR through the CPU; a direct GPU-to-GPU path would remove that.
+- **Frame rate:** 33-54 fps at 1440x1080 on an RTX 3050 (48-54 on NewDark 1.28, 33-38 in the last 1.29 run),
+  and 22-31 fps with the hardware T&L exe; SteamVR fills in the rest. Each frame is copied from the game's
+  Direct3D 9 to SteamVR through the CPU; a direct GPU-to-GPU path would remove that.
+- **Hardware T&L exe (`run_openvr_hwtl.bat`):** the light gem and held-item models are drawn in the left eye only.
 - **Rotation only:** leaning or moving your head sideways doesn't move the view (use the game's lean keys).
 - **Looking up/down with the mouse or stick tilts the world** in the headset. Leave the body level and look with your head.
 - **HUD text is small.** It is drawn for a monitor; hide the HUD when you don't need it.
